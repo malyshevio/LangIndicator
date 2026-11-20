@@ -59,6 +59,12 @@ Before delivering any code change, run two review subagents on model
   ESM `node --check` syntax check above and verify `metadata.json` uuid /
   `shell-version` against `scripts/install.sh`.
 
+## Versioning & commits
+- Conventional Commits: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`.
+- Bump `extension/metadata.json` `version` (int) and `version-name` (SemVer) on
+  each user-visible change; tag releases as `v<version-name>`.
+- Push to `main` after committing (`git push`).
+
 ## Project tracking
 Sprint plan and task board live in **YouGile** (project `LangIndicator`, prefix
 `LAN`), not in this repo. `readme.md` phases map to sprints 0–3.
