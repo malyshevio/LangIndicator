@@ -51,6 +51,14 @@ check works locally — `node --check` parses `.js` as CommonJS, so check as ESM
 cp extension/extension.js /tmp/extension.mjs && node --check /tmp/extension.mjs
 ```
 
+## Development workflow (mandatory)
+Before delivering any code change, run two review subagents on model
+`opencode-go/mimo-v2.6-flash` and fix their findings before finishing:
+- **codereviewer** — agent `coder`: correctness, GNOME Shell API usage, crash risk.
+- **tester** — agent `general`: static verification + bug hunt; must run the
+  ESM `node --check` syntax check above and verify `metadata.json` uuid /
+  `shell-version` against `scripts/install.sh`.
+
 ## Project tracking
 Sprint plan and task board live in **YouGile** (project `LangIndicator`, prefix
 `LAN`), not in this repo. `readme.md` phases map to sprints 0–3.

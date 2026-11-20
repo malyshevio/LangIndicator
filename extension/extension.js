@@ -11,6 +11,7 @@ import Atspi from 'gi://Atspi';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Mtk from 'gi://Mtk';
 import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -37,7 +38,7 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
         this.add_style_class_name('lang-indicator-boxpointer');
 
         // «Dummy»-актор задаёт точку привязки BoxPointer к каретке.
-        this._dummyCursor = new Clutter.Actor();
+        this._dummyCursor = new Clutter.Actor({opacity: 0});
         Main.layoutManager.uiGroup.add_child(this._dummyCursor);
         Main.layoutManager.addTopChrome(this);
 
@@ -47,7 +48,10 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
         box.add_child(this._label);
     }
 
-    show(text, rect) {
+    // Названо animate(), а не show(): show() перекрыл бы Clutter.Actor.show(),
+    // который BoxPointer.open() вызывает внутри себя (рекурсивный вызов с
+    // пустым rect). Тот же приём — в Better IBus.
+    animate(text, rect) {
         this._label.text = text;
 
         if (this._timeoutId) {
@@ -77,7 +81,7 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
         }
         this.close(BoxPointer.PopupAnimation.NONE);
         Main.layoutManager.removeChrome(this);
-        Main.layoutManager.uiGroup.remove_child(this._dummyCursor);
+        this._dummyCursor.destroy();
         this._dummyCursor = null;
         super.destroy();
     }
@@ -87,40 +91,90 @@ export default class LangIndicatorExtension extends Extension {
     enable() {
         this._indicator = new Indicator();
         this._inputSourceManager = getInputSourceManager();
-        this._panelService = getIBusManager()._panelService;
+        this._ibusManager = getIBusManager();
+        this._panelService = null;
         this._lastGeometry = null;
 
         // Смена источника ввода (раскладки).
         this._inputSourceManager.connectObject(
             'current-source-changed', () => this._showCurrentLayout(), this);
 
-        // Основной путь: позиция каретки от IBus panel service.
-        if (this._panelService) {
-            this._panelService.connectObject(
-                'set-cursor-location', (_svc, x, y, w, h) => {
-                    this._lastGeometry = {x, y, width: w, height: h};
-                },
-                'set-cursor-location-relative', (_svc, x, y, w, h) => {
-                    const wActor =
-                        global.display.focus_window?.get_compositor_private();
-                    if (!wActor)
-                        return;
-                    this._lastGeometry = {
-                        x: wActor.x + x,
-                        y: wActor.y + y,
-                        width: w,
-                        height: h,
-                    };
-                },
-                this);
-        }
+        // IBus panel service создаётся асинхронно: подписываемся на ready,
+        // чтобы подключиться к сигналам позиции, когда сервис будет готов.
+        this._ibusManager.connectObject(
+            'ready', () => this._syncPanelService(), this);
+        this._syncPanelService();
+
+        // Сбрасываем закешированную позицию при смене окна фокуса.
+        global.display.connectObject(
+            'notify::focus-window', () => {
+                this._lastGeometry = null;
+            }, this);
 
         // Fallback: AT-SPI для приложений, не сообщающих позицию в IBus.
         if (ENABLE_ATSPI_FALLBACK)
             this._initAtspiFallback();
 
-        // Показ при запуске утилиты.
+        // На старте позиция каретки ещё неизвестна; индикатор появится при
+        // первой смене раскладки после получения позиции.
         this._showCurrentLayout();
+    }
+
+    _syncPanelService() {
+        if (this._panelService) {
+            this._panelService.disconnectObject(this);
+            this._panelService = null;
+        }
+
+        const service = this._ibusManager._panelService;
+        if (!this._ibusManager._ready || !service)
+            return;
+
+        this._panelService = service;
+
+        // Абсолютная позиция каретки. Логика — как в ui/ibusCandidatePopup.js.
+        this._panelService.connectObject(
+            'set-cursor-location', (_svc, x, y, w, h) => {
+                const focusWindow = global.display.focus_window;
+                let rect = new Mtk.Rectangle({x, y, width: w, height: h});
+                if (!global.stage.key_focus && focusWindow)
+                    rect = focusWindow.protocol_to_stage_rect(rect);
+                this._lastGeometry = {
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                };
+            }, this);
+
+        // Относительная позиция (Wayland-клиенты). Сигнал есть не во всех IBus.
+        try {
+            this._panelService.connectObject(
+                'set-cursor-location-relative', (_svc, x, y, w, h) => {
+                    const focusWindow = global.display.focus_window;
+                    if (!focusWindow)
+                        return;
+                    let rect = new Mtk.Rectangle({x, y, width: w, height: h});
+                    rect = focusWindow.protocol_to_stage_rect(rect);
+                    const windowActor = focusWindow.get_compositor_private();
+                    // IBus GtkIMModule не знает о масштабе Shell.
+                    const scale = windowActor.get_resource_scale();
+                    this._lastGeometry = {
+                        x: Math.round(windowActor.x + (rect.x / scale)),
+                        y: Math.round(windowActor.y + (rect.y / scale)),
+                        width: Math.round(rect.width / scale),
+                        height: Math.round(rect.height / scale),
+                    };
+                }, this);
+        } catch (e) {
+            // Only recent IBus versions have support for this signal.
+        }
+
+        // Сбрасываем позицию при потере фокуса ввода.
+        this._panelService.connectObject(
+            'focus-out', () => {
+                this._lastGeometry = null;
+            }, this);
     }
 
     _initAtspiFallback() {
@@ -142,12 +196,13 @@ export default class LangIndicatorExtension extends Extension {
 
     _onAtspiCaretMoved(event) {
         try {
-            const text = event.source?.get_text_iface();
+            const accessible = event.source;
+            const text = accessible?.get_text_iface();
             if (!text)
                 return;
             const extents = text.get_character_extents(
                 text.get_caret_offset(), Atspi.CoordType.WINDOW);
-            const rect = this._convertExtentsToScreenSpace(text, extents);
+            const rect = this._convertExtentsToScreenSpace(accessible, extents);
             if (rect)
                 this._lastGeometry = rect;
         } catch (e) {
@@ -208,11 +263,6 @@ export default class LangIndicatorExtension extends Extension {
         const src = this._inputSourceManager.currentSource;
         if (!src)
             return '';
-
-        const labels = Main.panel.statusArea.keyboard?._indicatorLabels;
-        if (labels && labels[src.index])
-            return labels[src.index].get_text();
-
         return src.shortName || '?';
     }
 
@@ -223,12 +273,14 @@ export default class LangIndicatorExtension extends Extension {
         const label = this._currentLayoutLabel();
         if (!label)
             return;
-        this._indicator.show(label, g);
+        this._indicator.animate(label, g);
     }
 
     disable() {
         this._inputSourceManager?.disconnectObject(this);
+        this._ibusManager?.disconnectObject(this);
         this._panelService?.disconnectObject(this);
+        global.display?.disconnectObject(this);
 
         if (this._atspiListener) {
             try {
@@ -242,6 +294,7 @@ export default class LangIndicatorExtension extends Extension {
         this._indicator?.destroy();
         this._indicator = null;
         this._inputSourceManager = null;
+        this._ibusManager = null;
         this._panelService = null;
         this._lastGeometry = null;
     }
