@@ -94,6 +94,7 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager = getIBusManager();
         this._panelService = null;
         this._lastGeometry = null;
+        this._geometryWindow = null;
 
         // Смена источника ввода (раскладки).
         this._inputSourceManager.connectObject(
@@ -104,12 +105,6 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager.connectObject(
             'ready', () => this._syncPanelService(), this);
         this._syncPanelService();
-
-        // Сбрасываем закешированную позицию при смене окна фокуса.
-        global.display.connectObject(
-            'notify::focus-window', () => {
-                this._lastGeometry = null;
-            }, this);
 
         // Fallback: AT-SPI для приложений, не сообщающих позицию в IBus.
         if (ENABLE_ATSPI_FALLBACK)
@@ -145,6 +140,7 @@ export default class LangIndicatorExtension extends Extension {
                     width: Math.round(rect.width),
                     height: Math.round(rect.height),
                 };
+                this._geometryWindow = focusWindow;
             }, this);
 
         // Относительная позиция (Wayland-клиенты). Сигнал есть не во всех IBus.
@@ -165,16 +161,11 @@ export default class LangIndicatorExtension extends Extension {
                         width: Math.round(rect.width / scale),
                         height: Math.round(rect.height / scale),
                     };
+                    this._geometryWindow = focusWindow;
                 }, this);
         } catch (e) {
             // Only recent IBus versions have support for this signal.
         }
-
-        // Сбрасываем позицию при потере фокуса ввода.
-        this._panelService.connectObject(
-            'focus-out', () => {
-                this._lastGeometry = null;
-            }, this);
     }
 
     _initAtspiFallback() {
@@ -203,8 +194,10 @@ export default class LangIndicatorExtension extends Extension {
             const extents = text.get_character_extents(
                 text.get_caret_offset(), Atspi.CoordType.WINDOW);
             const rect = this._convertExtentsToScreenSpace(accessible, extents);
-            if (rect)
+            if (rect) {
                 this._lastGeometry = rect;
+                this._geometryWindow = global.display.focus_window;
+            }
         } catch (e) {
             // Игнорируем отдельные события без корректных extents.
         }
@@ -268,11 +261,23 @@ export default class LangIndicatorExtension extends Extension {
 
     _showCurrentLayout() {
         const g = this._lastGeometry;
-        if (!g)
+        const focusWindow = global.display.focus_window;
+
+        if (!g || !this._geometryWindow) {
+            log('[LangIndicator] show: нет позиции каретки');
             return;
+        }
+        // Показываем только если позиция принадлежит текущему окну фокуса.
+        if (this._geometryWindow !== focusWindow) {
+            log('[LangIndicator] show: позиция от другого окна, пропускаю');
+            return;
+        }
+
         const label = this._currentLayoutLabel();
         if (!label)
             return;
+
+        log(`[LangIndicator] show "${label}" @ ${g.x},${g.y}`);
         this._indicator.animate(label, g);
     }
 
@@ -280,7 +285,6 @@ export default class LangIndicatorExtension extends Extension {
         this._inputSourceManager?.disconnectObject(this);
         this._ibusManager?.disconnectObject(this);
         this._panelService?.disconnectObject(this);
-        global.display?.disconnectObject(this);
 
         if (this._atspiListener) {
             try {
@@ -297,5 +301,6 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager = null;
         this._panelService = null;
         this._lastGeometry = null;
+        this._geometryWindow = null;
     }
 }
