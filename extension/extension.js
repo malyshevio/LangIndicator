@@ -21,6 +21,9 @@ import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keybo
 
 const CARET_MOVED = 'object:text-caret-moved';
 const INDICATOR_DURATION_MS = 1000;
+// Глобальный AT-SPI listener может ронять сессию (нативный крэш). Временно
+// отключён — включить обратно только после диагностики по журналу.
+const ENABLE_ATSPI_FALLBACK = false;
 
 const Indicator = class Indicator extends BoxPointer.BoxPointer {
     static {
@@ -30,6 +33,7 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
     constructor() {
         super(St.Side.TOP);
         this._timeoutId = null;
+        this.visible = false;
         this.add_style_class_name('lang-indicator-boxpointer');
 
         // «Dummy»-актор задаёт точку привязки BoxPointer к каретке.
@@ -112,7 +116,8 @@ export default class LangIndicatorExtension extends Extension {
         }
 
         // Fallback: AT-SPI для приложений, не сообщающих позицию в IBus.
-        this._initAtspiFallback();
+        if (ENABLE_ATSPI_FALLBACK)
+            this._initAtspiFallback();
 
         // Показ при запуске утилиты.
         this._showCurrentLayout();
