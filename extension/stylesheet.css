@@ -1,0 +1,16 @@
+/* Lang Indicator — стили оверлея. */
+
+/* BoxPointer обёртка (стрелка + контент). Базовое оформление берётся из
+   popup-menu-boxpointer темы GNOME Shell, здесь — мелкие дополнения. */
+.lang-indicator-boxpointer {
+}
+
+.lang-indicator-content {
+    padding: 2px 4px;
+}
+
+.lang-indicator-label {
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: bold;
+}
