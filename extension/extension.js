@@ -1,9 +1,9 @@
 // Lang Indicator — индикатор раскладки у курсора ввода (GNOME Shell, Wayland).
 //
-// Текущее ТЗ (упрощённое):
-//   • показываем текущий язык («RU»/«EN») у каретки при ПЕРЕХОДЕ В НОВОЕ ОКНО;
-//   • ждём свежую позицию каретки нового окна (IBus set-cursor-location*) и
-//     показываем индикатор один раз.
+// Текущее ТЗ:
+//   • индикатор НЕ исчезает (без автоскрытия);
+//   • позиция следует за кареткой в ЛЮБОМ окне (на каждое set-cursor-location*);
+//   • текст («RU»/«EN») обновляется при смене раскладки.
 //
 // Подробности архитектуры — docs/research.md, план — в YouGile.
 
@@ -21,7 +21,6 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 
 const CARET_MOVED = 'object:text-caret-moved';
-const INDICATOR_DURATION_MS = 1000;
 // Глобальный AT-SPI listener может ронять сессию (нативный крэш). Временно
 // отключён — включить обратно только после диагностики по журналу.
 const ENABLE_ATSPI_FALLBACK = false;
@@ -33,7 +32,6 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
 
     constructor() {
         super(St.Side.TOP);
-        this._timeoutId = null;
         this.visible = false;
         this.add_style_class_name('lang-indicator-boxpointer');
 
@@ -48,36 +46,22 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
         box.add_child(this._label);
     }
 
-    // Названо animate(), а не show(): show() перекрыл бы Clutter.Actor.show(),
-    // который BoxPointer.open() вызывает внутри себя. Тот же приём — в Better IBus.
-    animate(text, rect) {
+    // Показать/обновить текст и позицию. Не скрывается автоматически.
+    // Названо не show(), чтобы не перекрыть Clutter.Actor.show(), который
+    // BoxPointer.open() вызывает внутри себя.
+    update(text, rect) {
         this._label.text = text;
-
-        if (this._timeoutId) {
-            GLib.source_remove(this._timeoutId);
-            this._timeoutId = null;
-        }
-
         this._dummyCursor.set_position(rect.x, rect.y);
         this._dummyCursor.set_size(
             rect.width > 0 ? rect.width : 1,
             rect.height > 0 ? rect.height : 1);
         this.setPosition(this._dummyCursor, 0);
-        this.open(BoxPointer.PopupAnimation.FULL);
 
-        this._timeoutId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT, INDICATOR_DURATION_MS, () => {
-                this.close(BoxPointer.PopupAnimation.FULL);
-                this._timeoutId = null;
-                return GLib.SOURCE_REMOVE;
-            });
+        if (!this.visible)
+            this.open(BoxPointer.PopupAnimation.NONE);
     }
 
     destroy() {
-        if (this._timeoutId) {
-            GLib.source_remove(this._timeoutId);
-            this._timeoutId = null;
-        }
         this.close(BoxPointer.PopupAnimation.NONE);
         Main.layoutManager.removeChrome(this);
         this._dummyCursor.destroy();
@@ -92,31 +76,16 @@ export default class LangIndicatorExtension extends Extension {
         this._inputSourceManager = getInputSourceManager();
         this._ibusManager = getIBusManager();
         this._panelService = null;
-
         this._geometry = null;
-        this._pendingFocus = false;
-        this._lastWindowId = global.display.focus_window?.get_id() ?? null;
 
         // IBus panel service создаётся асинхронно: подписываемся на ready.
         this._ibusManager.connectObject(
             'ready', () => this._syncPanelService(), this);
         this._syncPanelService();
 
-        // Триггер: переход в новое окно.
-        global.display.connectObject(
-            'notify::focus-window', () => this._onFocusChanged(), this);
-    }
-
-    _onFocusChanged() {
-        const id = global.display.focus_window?.get_id() ?? null;
-        if (id === this._lastWindowId)
-            return;
-
-        this._lastWindowId = id;
-        this._geometry = null;
-        // Ждём свежую позицию каретки для нового окна.
-        this._pendingFocus = true;
-        log(`[LangIndicator] focus -> window=${id}, ждём позицию каретки`);
+        // Смена раскладки — обновляем текст индикатора.
+        this._inputSourceManager.connectObject(
+            'current-source-changed', () => this._updateIndicator(), this);
     }
 
     _syncPanelService() {
@@ -133,14 +102,12 @@ export default class LangIndicatorExtension extends Extension {
 
         this._panelService.connectObject(
             'set-cursor-location', (_svc, x, y, w, h) => {
-                log(`[LangIndicator] caret (abs) xywh=${x},${y},${w},${h}`);
                 this._setGeometry(x, y, w, h, false);
             }, this);
 
         try {
             this._panelService.connectObject(
                 'set-cursor-location-relative', (_svc, x, y, w, h) => {
-                    log(`[LangIndicator] caret (rel) xywh=${x},${y},${w},${h}`);
                     this._setGeometry(x, y, w, h, true);
                 }, this);
         } catch (e) {
@@ -160,11 +127,8 @@ export default class LangIndicatorExtension extends Extension {
             return;
 
         this._geometry = rect;
-
-        if (this._pendingFocus) {
-            this._pendingFocus = false;
-            this._showIndicator();
-        }
+        log(`[LangIndicator] caret @ ${rect.x},${rect.y} (${relative ? 'rel' : 'abs'})`);
+        this._updateIndicator();
     }
 
     // Перевод координат IBus в stage. Повторяет ui/ibusCandidatePopup.js.
@@ -226,10 +190,7 @@ export default class LangIndicatorExtension extends Extension {
             const rect = this._convertExtentsToScreenSpace(accessible, extents);
             if (rect) {
                 this._geometry = rect;
-                if (this._pendingFocus) {
-                    this._pendingFocus = false;
-                    this._showIndicator();
-                }
+                this._updateIndicator();
             }
         } catch (e) {
             // Игнорируем отдельные события без корректных extents.
@@ -291,22 +252,19 @@ export default class LangIndicatorExtension extends Extension {
         return src.shortName || '?';
     }
 
-    _showIndicator() {
+    _updateIndicator() {
         if (!this._geometry)
             return;
         const label = this._currentLayoutLabel();
         if (!label)
             return;
-
-        log(`[LangIndicator] show "${label}" @ ${this._geometry.x},${this._geometry.y},${this._geometry.width},${this._geometry.height}`);
-        this._indicator.animate(label, this._geometry);
+        this._indicator.update(label, this._geometry);
     }
 
     disable() {
         this._inputSourceManager?.disconnectObject(this);
         this._ibusManager?.disconnectObject(this);
         this._panelService?.disconnectObject(this);
-        global.display?.disconnectObject(this);
 
         if (this._atspiListener) {
             try {
@@ -323,7 +281,5 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager = null;
         this._panelService = null;
         this._geometry = null;
-        this._pendingFocus = false;
-        this._lastWindowId = null;
     }
 }
