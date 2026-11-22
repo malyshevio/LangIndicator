@@ -403,6 +403,7 @@ export default class LangIndicatorExtension extends Extension {
         if (this._atspiListener) {
             try {
                 this._atspiListener.deregister(CARET_MOVED);
+                this._atspiListener.deregister('object:state-changed:focused');
             } catch (e) {
                 // ignore
             }
