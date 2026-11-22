@@ -182,6 +182,12 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     _setGeometry(x, y, w, h, relative) {
+        // AT-SPI даёт текущую позицию, IBus — на шаг позади. Если AT-SPI недавно
+        // присылал позицию, IBus не перебиваем (иначе индикатор «запаздывает»).
+        if (this._lastAtspiAt &&
+            GLib.get_monotonic_time() - this._lastAtspiAt < 300000)
+            return;
+
         if (w === 0 && h === 0)
             return;
 
@@ -274,12 +280,6 @@ export default class LangIndicatorExtension extends Extension {
             if (!isCaret && !isFocus)
                 return;
 
-            // IBus точнее и без задержки; AT-SPI — только если IBus молчит
-            // (фокус, стрелки). Не перебиваем свежую IBus-позицию.
-            if (this._lastIbusAt &&
-                GLib.get_monotonic_time() - this._lastIbusAt < 300000)
-                return;
-
             const accessible = event.source;
             const text = accessible?.get_text_iface();
             if (!text)
@@ -330,6 +330,23 @@ export default class LangIndicatorExtension extends Extension {
                 accessible.get_state_set().contains(Atspi.StateType.FOCUSED);
             if (!windowActive || !accessibleFocused)
                 return null;
+
+            // Только события приложения из текущего окна фокуса (без чужого
+            // «мельтешения» от других приложений).
+            const focusWindow = global.display.focus_window;
+            if (focusWindow) {
+                const focusPid = focusWindow.get_pid();
+                if (focusPid > 0 && app) {
+                    let appPid = -1;
+                    try {
+                        appPid = app.get_process_id();
+                    } catch (e2) {
+                        appPid = -1;
+                    }
+                    if (appPid > 0 && appPid !== focusPid)
+                        return null;
+                }
+            }
         } catch (e) {
             return null;
         }
