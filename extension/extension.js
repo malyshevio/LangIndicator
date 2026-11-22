@@ -23,7 +23,7 @@ import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keybo
 const CARET_MOVED = 'object:text-caret-moved';
 // Глобальный AT-SPI listener может ронять сессию (нативный крэш). Временно
 // отключён — включить обратно только после диагностики по журналу.
-const ENABLE_ATSPI_FALLBACK = false;
+const ENABLE_ATSPI_FALLBACK = true;
 
 const Indicator = class Indicator extends BoxPointer.BoxPointer {
     static {
@@ -77,6 +77,7 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager = getIBusManager();
         this._panelService = null;
         this._geometry = null;
+        this._lastAtspiAt = 0;
 
         // IBus panel service создаётся асинхронно: подписываемся на ready.
         this._ibusManager.connectObject(
@@ -124,6 +125,11 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     _setGeometry(x, y, w, h, relative) {
+        // AT-SPI точнее; если он недавно присылал позицию — IBus не перебиваем.
+        if (this._lastAtspiAt &&
+            GLib.get_monotonic_time() - this._lastAtspiAt < 800000)
+            return;
+
         // IBus может прислать «пустую» позицию 0,0,0,0 до того, как узнает
         // каретку. Реальный прямоугольник каретки имеет ненулевую высоту
         // (ширина может быть 0 — это вертикальная черта).
@@ -197,7 +203,9 @@ export default class LangIndicatorExtension extends Extension {
                 text.get_caret_offset(), Atspi.CoordType.WINDOW);
             const rect = this._convertExtentsToScreenSpace(accessible, extents);
             if (rect) {
+                this._lastAtspiAt = GLib.get_monotonic_time();
                 this._geometry = rect;
+                log(`[LangIndicator] atspi caret -> ${rect.x},${rect.y}`);
                 this._updateIndicator();
             }
         } catch (e) {
@@ -296,5 +304,6 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager = null;
         this._panelService = null;
         this._geometry = null;
+        this._lastAtspiAt = 0;
     }
 }
