@@ -288,7 +288,7 @@ export default class LangIndicatorExtension extends Extension {
                 text.get_caret_offset(), Atspi.CoordType.WINDOW);
             if (!extents || (extents.width === 0 && extents.height === 0))
                 return;
-            const rect = this._convertExtentsToScreenSpace(accessible, extents);
+            const rect = this._convertExtentsToScreenSpace(accessible, extents, isFocus);
             if (!rect)
                 return;
             this._lastAtspiAt = GLib.get_monotonic_time();
@@ -303,7 +303,7 @@ export default class LangIndicatorExtension extends Extension {
         }
     }
 
-    _convertExtentsToScreenSpace(accessible, extents) {
+    _convertExtentsToScreenSpace(accessible, extents, isFocus) {
         const toplevelWindowTypes = new Set(
             [Atspi.Role.FRAME, Atspi.Role.DIALOG, Atspi.Role.WINDOW]);
 
@@ -324,27 +324,30 @@ export default class LangIndicatorExtension extends Extension {
             if (app && app.get_name() === 'gnome-shell')
                 return null;
 
-            const windowActive = parentWindow &&
-                parentWindow.get_state_set().contains(Atspi.StateType.ACTIVE);
-            const accessibleFocused =
-                accessible.get_state_set().contains(Atspi.StateType.FOCUSED);
-            if (!windowActive || !accessibleFocused)
-                return null;
+            // Для focus-события доверяем самому событию (элемент только что
+            // получил фокус) — a11y-состояния ACTIVE/FOCUSED в кеше могут
+            // отставать. Для caret-moved — строгий фильтр.
+            if (!isFocus) {
+                const windowActive = parentWindow &&
+                    parentWindow.get_state_set().contains(Atspi.StateType.ACTIVE);
+                const accessibleFocused =
+                    accessible.get_state_set().contains(Atspi.StateType.FOCUSED);
+                if (!windowActive || !accessibleFocused)
+                    return null;
 
-            // Только события приложения из текущего окна фокуса (без чужого
-            // «мельтешения» от других приложений).
-            const focusWindow = global.display.focus_window;
-            if (focusWindow) {
-                const focusPid = focusWindow.get_pid();
-                if (focusPid > 0 && app) {
-                    let appPid = -1;
-                    try {
-                        appPid = app.get_process_id();
-                    } catch (e2) {
-                        appPid = -1;
+                const focusWindow = global.display.focus_window;
+                if (focusWindow) {
+                    const focusPid = focusWindow.get_pid();
+                    if (focusPid > 0 && app) {
+                        let appPid = -1;
+                        try {
+                            appPid = app.get_process_id();
+                        } catch (e2) {
+                            appPid = -1;
+                        }
+                        if (appPid > 0 && appPid !== focusPid)
+                            return null;
                     }
-                    if (appPid > 0 && appPid !== focusPid)
-                        return null;
                 }
             }
         } catch (e) {
