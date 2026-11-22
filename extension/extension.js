@@ -94,7 +94,7 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager = getIBusManager();
         this._panelService = null;
         this._lastGeometry = null;
-        this._geometryWindow = null;
+        this._geometryWindowId = null;
 
         // Смена источника ввода (раскладки).
         this._inputSourceManager.connectObject(
@@ -140,7 +140,7 @@ export default class LangIndicatorExtension extends Extension {
                     width: Math.round(rect.width),
                     height: Math.round(rect.height),
                 };
-                this._geometryWindow = focusWindow;
+                this._geometryWindowId = focusWindow ? focusWindow.get_id() : null;
             }, this);
 
         // Относительная позиция (Wayland-клиенты). Сигнал есть не во всех IBus.
@@ -161,7 +161,7 @@ export default class LangIndicatorExtension extends Extension {
                         width: Math.round(rect.width / scale),
                         height: Math.round(rect.height / scale),
                     };
-                    this._geometryWindow = focusWindow;
+                    this._geometryWindowId = focusWindow ? focusWindow.get_id() : null;
                 }, this);
         } catch (e) {
             // Only recent IBus versions have support for this signal.
@@ -196,7 +196,8 @@ export default class LangIndicatorExtension extends Extension {
             const rect = this._convertExtentsToScreenSpace(accessible, extents);
             if (rect) {
                 this._lastGeometry = rect;
-                this._geometryWindow = global.display.focus_window;
+                this._geometryWindowId =
+                    global.display.focus_window?.get_id() ?? null;
             }
         } catch (e) {
             // Игнорируем отдельные события без корректных extents.
@@ -263,13 +264,14 @@ export default class LangIndicatorExtension extends Extension {
         const g = this._lastGeometry;
         const focusWindow = global.display.focus_window;
 
-        if (!g || !this._geometryWindow) {
+        if (!g || this._geometryWindowId === null) {
             log('[LangIndicator] show: нет позиции каретки');
             return;
         }
         // Показываем только если позиция принадлежит текущему окну фокуса.
-        if (this._geometryWindow !== focusWindow) {
-            log('[LangIndicator] show: позиция от другого окна, пропускаю');
+        const focusId = focusWindow ? focusWindow.get_id() : null;
+        if (this._geometryWindowId !== focusId) {
+            log(`[LangIndicator] show: позиция от другого окна (geom=${this._geometryWindowId} focus=${focusId}), пропускаю`);
             return;
         }
 
@@ -301,6 +303,6 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager = null;
         this._panelService = null;
         this._lastGeometry = null;
-        this._geometryWindow = null;
+        this._geometryWindowId = null;
     }
 }
