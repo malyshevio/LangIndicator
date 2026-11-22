@@ -2,8 +2,8 @@
 //
 // Позиционирование: IBus (set-cursor-location*) даёт точные stage-координаты, но
 // приходит только при движении/вводе. AT-SPI дополняет — показывает позицию при
-// фокусе и на стрелках (IBus там молчит); используется, только если IBus недавно
-// не присылал позицию.
+// фокусе и на стрелках (IBus там молчит). Приоритета нет: последнее событие
+// (IBus или AT-SPI) побеждает.
 //
 // Поведение: индикатор следует за кареткой, не исчезает; скрывается при потере
 // фокуса; при смене окна ждёт позицию новой каретки (не висит на прошлой).
@@ -69,7 +69,8 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
 
 export default class LangIndicatorExtension extends Extension {
     enable() {
-        log('[LangIndicator] v0.4.1 enable');
+        const version = this.metadata?.['version-name'] ?? 'unknown';
+        log(`[LangIndicator] v${version} enable`);
         this._indicator = new Indicator();
         this._inputSourceManager = getInputSourceManager();
         this._ibusManager = getIBusManager();
@@ -79,8 +80,6 @@ export default class LangIndicatorExtension extends Extension {
         this._visible = false;
         this._updateScheduled = false;
         this._updateTimeoutId = 0;
-        this._lastAtspiAt = 0;
-        this._lastIbusAt = 0;
         this._windowActor = null;
         this._actorX = 0;
         this._actorY = 0;
@@ -107,10 +106,15 @@ export default class LangIndicatorExtension extends Extension {
         }
 
         const service = this._ibusManager._panelService;
-        if (!this._ibusManager._ready || !service)
+        if (!this._ibusManager._ready || !service) {
+            if (DEBUG)
+                log(`[LangIndicator] ibus panel service не готов (ready=${this._ibusManager._ready}, service=${!!service})`);
             return;
+        }
 
         this._panelService = service;
+        if (DEBUG)
+            log('[LangIndicator] ibus panel service подключён');
 
         this._panelService.connectObject(
             'set-cursor-location', (_svc, x, y, w, h) => {
@@ -127,7 +131,7 @@ export default class LangIndicatorExtension extends Extension {
         }
 
         this._panelService.connectObject(
-            'focus-out', () => this._hideIndicator(), this);
+            'focus-out', () => this._hideIndicator('focus-out'), this);
     }
 
     _onFocusWindowChanged() {
@@ -138,7 +142,8 @@ export default class LangIndicatorExtension extends Extension {
 
         const win = global.display.focus_window;
         const actor = win?.get_compositor_private();
-        log(`[LangIndicator] focus window=${win ? win.get_id() : 'null'}`);
+        if (DEBUG)
+            log(`[LangIndicator] focus window=${win ? win.get_id() : 'null'} actor=${actor ? `${actor.x},${actor.y}` : 'null'}`);
         if (actor) {
             this._windowActor = actor;
             this._actorX = actor.x;
@@ -151,9 +156,7 @@ export default class LangIndicatorExtension extends Extension {
 
         // Смена окна: сбрасываем геометрию, чтобы не показать на прошлом месте.
         this._geometry = null;
-        this._lastAtspiAt = 0;
-        this._lastIbusAt = 0;
-        this._hideIndicator();
+        this._hideIndicator('focus-window-changed');
     }
 
     // Каретка на экране смещается вместе с окном — сдвигаем позицию.
@@ -165,6 +168,8 @@ export default class LangIndicatorExtension extends Extension {
         const dy = this._windowActor.y - this._actorY;
         if (dx === 0 && dy === 0)
             return;
+        if (DEBUG)
+            log(`[LangIndicator] window moved dx=${dx} dy=${dy}`);
 
         // Базу обновляем ВСЕГДА, даже без геометрии каретки: иначе при
         // следующем движении применим накопленную дельту повторно.
@@ -190,8 +195,11 @@ export default class LangIndicatorExtension extends Extension {
             return;
 
         const focusWindow = global.display.focus_window;
-        if (!focusWindow)
+        if (!focusWindow) {
+            if (DEBUG)
+                log('[LangIndicator] caret: нет окна фокуса, skip');
             return;
+        }
 
         // Санити-чек: каретка должна быть в пределах окна фокуса. Опираемся на
         // rect window actor (на него же опирается конвертация); отсекает
@@ -203,12 +211,14 @@ export default class LangIndicatorExtension extends Extension {
         const bw = winActor ? winActor.width : fr.width;
         const bh = winActor ? winActor.height : fr.height;
         if (rect.x < bx - 16 || rect.x > bx + bw + 16 ||
-            rect.y < by - 16 || rect.y > by + bh + 16)
+            rect.y < by - 16 || rect.y > by + bh + 16) {
+            if (DEBUG)
+                log(`[LangIndicator] caret ${rect.x},${rect.y} вне окна ${bx},${by} ${bw}x${bh}, skip`);
             return;
+        }
 
         this._geometry = rect;
         this._visible = true;
-        this._lastIbusAt = GLib.get_monotonic_time();
         if (DEBUG)
             log(`[LangIndicator] caret ${relative ? 'rel' : 'abs'} raw=${x},${y} -> ${rect.x},${rect.y}`);
         this._scheduleUpdate();
@@ -217,16 +227,22 @@ export default class LangIndicatorExtension extends Extension {
     // Перевод координат IBus в stage. Повторяет ui/ibusCandidatePopup.js.
     _toStage(x, y, w, h, relative) {
         const focusWindow = global.display.focus_window;
-        if (!focusWindow)
+        if (!focusWindow) {
+            if (DEBUG)
+                log('[LangIndicator] _toStage: нет окна фокуса');
             return null;
+        }
 
         let rect = new Mtk.Rectangle({x, y, width: w, height: h});
 
         if (relative) {
             rect = focusWindow.protocol_to_stage_rect(rect);
             const windowActor = focusWindow.get_compositor_private();
-            if (!windowActor)
+            if (!windowActor) {
+                if (DEBUG)
+                    log('[LangIndicator] _toStage: нет window actor (relative)');
                 return null;
+            }
             const scale = windowActor.get_resource_scale();
             rect.x = windowActor.x + (rect.x / scale);
             rect.y = windowActor.y + (rect.y / scale);
@@ -244,7 +260,7 @@ export default class LangIndicatorExtension extends Extension {
         };
     }
 
-    // --- AT-SPI (отключён, оставлен под флагом) ---
+    // --- AT-SPI fallback (включён под флагом ENABLE_ATSPI_FALLBACK) ---
     _initAtspiFallback() {
         this._atspiListener = null;
         try {
@@ -266,6 +282,8 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     _onAtspiCaretMoved(event) {
+        if (!this._indicator || !this._inputSourceManager)
+            return;
         try {
             const type = event?.type ?? '';
             const isCaret = type === 'object:text-caret-moved';
@@ -276,19 +294,29 @@ export default class LangIndicatorExtension extends Extension {
 
             const accessible = event.source;
             const text = accessible?.get_text_iface();
-            if (!text)
+            if (!text) {
+                if (DEBUG)
+                    log('[LangIndicator] atspi: нет text iface, skip');
                 return;
+            }
             // Для caret-moved берём offset из события (detail1) — запрос
             // get_caret_offset() может вернуть устаревший (на шаг позади).
             const caretOffset = isCaret ? event.detail1 : text.get_caret_offset();
+            if (caretOffset < 0) {
+                if (DEBUG)
+                    log('[LangIndicator] atspi: caret offset < 0, skip');
+                return;
+            }
             const extents = text.get_character_extents(
                 caretOffset, Atspi.CoordType.WINDOW);
-            if (!extents || (extents.width === 0 && extents.height === 0))
+            if (!extents || (extents.width === 0 && extents.height === 0)) {
+                if (DEBUG)
+                    log('[LangIndicator] atspi: пустые extents, skip');
                 return;
+            }
             const rect = this._convertExtentsToScreenSpace(accessible, extents, isFocus);
             if (!rect)
                 return;
-            this._lastAtspiAt = GLib.get_monotonic_time();
             this._geometry = rect;
             this._visible = true;
             if (DEBUG)
@@ -329,33 +357,42 @@ export default class LangIndicatorExtension extends Extension {
                 };
             }
 
-            // Для focus-события доверяем самому событию (элемент только что
-            // получил фокус) — a11y-состояния ACTIVE/FOCUSED в кеше могут
-            // отставать. Для caret-moved — строгий фильтр.
+            // PID — статичная идентичность, не «отстаёт»; проверяем всегда,
+            // чтобы отсечь запоздалые focus-события от другого приложения.
+            const focusWindow = global.display.focus_window;
+            if (focusWindow) {
+                const focusPid = focusWindow.get_pid();
+                if (focusPid > 0 && app) {
+                    let appPid = -1;
+                    try {
+                        appPid = app.get_process_id();
+                    } catch (e2) {
+                        appPid = -1;
+                    }
+                    if (appPid > 0 && appPid !== focusPid) {
+                        if (DEBUG)
+                            log(`[LangIndicator] atspi: pid не совпал (app=${appPid}, focus=${focusPid}), skip`);
+                        return null;
+                    }
+                }
+            }
+
+            // ACTIVE/FOCUSED в a11y-кеше отстают от реального фокуса — для
+            // focus-события доверяем самому событию; для caret-moved — строго.
             if (!isFocus) {
                 const windowActive = parentWindow &&
                     parentWindow.get_state_set().contains(Atspi.StateType.ACTIVE);
                 const accessibleFocused =
                     accessible.get_state_set().contains(Atspi.StateType.FOCUSED);
-                if (!windowActive || !accessibleFocused)
+                if (!windowActive || !accessibleFocused) {
+                    if (DEBUG)
+                        log(`[LangIndicator] atspi: не в фокусе (windowActive=${!!windowActive}, accessibleFocused=${!!accessibleFocused}), skip`);
                     return null;
-
-                const focusWindow = global.display.focus_window;
-                if (focusWindow) {
-                    const focusPid = focusWindow.get_pid();
-                    if (focusPid > 0 && app) {
-                        let appPid = -1;
-                        try {
-                            appPid = app.get_process_id();
-                        } catch (e2) {
-                            appPid = -1;
-                        }
-                        if (appPid > 0 && appPid !== focusPid)
-                            return null;
-                    }
                 }
             }
         } catch (e) {
+            if (DEBUG)
+                log(`[LangIndicator] atspi: convert error ${e.message}`);
             return null;
         }
 
@@ -363,23 +400,21 @@ export default class LangIndicatorExtension extends Extension {
         if (!focusWindow)
             return null;
 
-        // Extents (CoordType.WINDOW) отсчитываются от поверхности окна, поэтому
-        // берём origin window actor (surface top), а не client_content_rect —
-        // иначе двойной учёт шапки (+49px).
-        const winActor = focusWindow.get_compositor_private();
-        const fr = focusWindow.get_frame_rect();
-        const originX = winActor ? winActor.x : fr.x;
-        const originY = winActor ? winActor.y : fr.y;
-        const width = winActor ? winActor.width : fr.width;
-        const height = winActor ? winActor.height : fr.height;
+        // По контракту mutter AT-SPI window-координаты отсчитываются от
+        // get_client_content_rect() (см. meta_window_get_client_content_rect и
+        // magnifier.js). Берём этот origin.
+        const windowRect = focusWindow.get_client_content_rect();
         const scaleFactor =
             St.ThemeContext.get_for_stage(global.stage).scale_factor;
-        const x = originX + (scaleFactor * extents.x);
-        const y = originY + (scaleFactor * extents.y);
+        const x = windowRect.x + (scaleFactor * extents.x);
+        const y = windowRect.y + (scaleFactor * extents.y);
 
-        if (x < originX - 16 || x > originX + width + 16 ||
-            y < originY - 16 || y > originY + height + 16)
+        if (x < windowRect.x - 16 || x > windowRect.x + windowRect.width + 16 ||
+            y < windowRect.y - 16 || y > windowRect.y + windowRect.height + 16) {
+            if (DEBUG)
+                log(`[LangIndicator] atspi: ${x},${y} вне окна ${windowRect.x},${windowRect.y} ${windowRect.width}x${windowRect.height}, skip`);
             return null;
+        }
 
         return {
             x,
@@ -410,21 +445,29 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     _updateIndicator() {
+        if (!this._indicator || !this._inputSourceManager)
+            return;
         if (!this._geometry || !this._visible)
             return;
         const label = this._currentLayoutLabel();
-        if (!label)
+        if (!label) {
+            if (DEBUG)
+                log('[LangIndicator] update: пустой label, skip');
             return;
+        }
         this._indicator.update(label, this._geometry);
     }
 
-    _hideIndicator() {
+    _hideIndicator(reason = '') {
         this._visible = false;
         if (this._indicator)
             this._indicator.close(BoxPointer.PopupAnimation.NONE);
+        if (DEBUG)
+            log(`[LangIndicator] hide${reason ? ` (${reason})` : ''}`);
     }
 
     disable() {
+        log('[LangIndicator] disable');
         this._inputSourceManager?.disconnectObject(this);
         this._ibusManager?.disconnectObject(this);
         this._panelService?.disconnectObject(this);
@@ -454,8 +497,6 @@ export default class LangIndicatorExtension extends Extension {
 
         this._geometry = null;
         this._visible = false;
-        this._lastAtspiAt = 0;
-        this._lastIbusAt = 0;
         this._updateScheduled = false;
     }
 }
