@@ -21,7 +21,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 
 const CARET_MOVED = 'object:text-caret-moved';
-const ENABLE_ATSPI_FALLBACK = false;
+const ENABLE_ATSPI_FALLBACK = true;
 const DEBUG = false;
 
 const Indicator = class Indicator extends BoxPointer.BoxPointer {
@@ -256,6 +256,7 @@ export default class LangIndicatorExtension extends Extension {
             this._atspiListener =
                 Atspi.EventListener.new(this._onAtspiCaretMoved.bind(this));
             this._atspiListener.register(CARET_MOVED);
+            this._atspiListener.register('object:state-changed:focused');
             log('[LangIndicator] AT-SPI listener registered');
         } catch (e) {
             log(`[LangIndicator] AT-SPI fallback выключен: ${e.message}`);
@@ -265,6 +266,13 @@ export default class LangIndicatorExtension extends Extension {
 
     _onAtspiCaretMoved(event) {
         try {
+            const type = event?.type ?? '';
+            const isCaret = type === 'object:text-caret-moved';
+            const isFocus = type.startsWith('object:state-changed') &&
+                event.detail1 === 1;
+            if (!isCaret && !isFocus)
+                return;
+
             const accessible = event.source;
             const text = accessible?.get_text_iface();
             if (!text)
@@ -279,9 +287,12 @@ export default class LangIndicatorExtension extends Extension {
             this._lastAtspiAt = GLib.get_monotonic_time();
             this._geometry = rect;
             this._visible = true;
+            if (DEBUG)
+                log(`[LangIndicator] atspi ${isFocus ? 'focus' : 'caret'} -> ${rect.x},${rect.y}`);
             this._scheduleUpdate();
         } catch (e) {
-            log(`[LangIndicator] atspi error: ${e.message}`);
+            if (DEBUG)
+                log(`[LangIndicator] atspi error: ${e.message}`);
         }
     }
 
@@ -320,14 +331,22 @@ export default class LangIndicatorExtension extends Extension {
         if (!focusWindow)
             return null;
 
-        const windowRect = focusWindow.get_client_content_rect();
+        // Extents (CoordType.WINDOW) отсчитываются от поверхности окна, поэтому
+        // берём origin window actor (surface top), а не client_content_rect —
+        // иначе двойной учёт шапки (+49px).
+        const winActor = focusWindow.get_compositor_private();
+        const fr = focusWindow.get_frame_rect();
+        const originX = winActor ? winActor.x : fr.x;
+        const originY = winActor ? winActor.y : fr.y;
+        const width = winActor ? winActor.width : fr.width;
+        const height = winActor ? winActor.height : fr.height;
         const scaleFactor =
             St.ThemeContext.get_for_stage(global.stage).scale_factor;
-        const x = windowRect.x + (scaleFactor * extents.x);
-        const y = windowRect.y + (scaleFactor * extents.y);
+        const x = originX + (scaleFactor * extents.x);
+        const y = originY + (scaleFactor * extents.y);
 
-        if (x < windowRect.x - 8 || x > windowRect.x + windowRect.width + 8 ||
-            y < windowRect.y - 8 || y > windowRect.y + windowRect.height + 8)
+        if (x < originX - 16 || x > originX + width + 16 ||
+            y < originY - 16 || y > originY + height + 16)
             return null;
 
         return {
