@@ -75,6 +75,7 @@ export default class LangIndicatorExtension extends Extension {
         this._geometry = null;
         this._visible = false;
         this._updateScheduled = false;
+        this._updateTimeoutId = 0;
         this._lastAtspiAt = 0;
         this._windowActor = null;
         this._actorX = 0;
@@ -152,7 +153,7 @@ export default class LangIndicatorExtension extends Extension {
 
     // Каретка на экране смещается вместе с окном — сдвигаем позицию.
     _followWindow() {
-        if (!this._windowActor || !this._geometry)
+        if (!this._windowActor)
             return;
 
         const dx = this._windowActor.x - this._actorX;
@@ -160,8 +161,14 @@ export default class LangIndicatorExtension extends Extension {
         if (dx === 0 && dy === 0)
             return;
 
+        // Базу обновляем ВСЕГДА, даже без геометрии каретки: иначе при
+        // следующем движении применим накопленную дельту повторно.
         this._actorX = this._windowActor.x;
         this._actorY = this._windowActor.y;
+
+        if (!this._geometry)
+            return;
+
         this._geometry.x += dx;
         this._geometry.y += dy;
 
@@ -334,11 +341,13 @@ export default class LangIndicatorExtension extends Extension {
         if (this._updateScheduled)
             return;
         this._updateScheduled = true;
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
-            this._updateScheduled = false;
-            this._updateIndicator();
-            return GLib.SOURCE_REMOVE;
-        });
+        this._updateTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, 16, () => {
+                this._updateScheduled = false;
+                this._updateTimeoutId = 0;
+                this._updateIndicator();
+                return GLib.SOURCE_REMOVE;
+            });
     }
 
     _updateIndicator() {
@@ -378,6 +387,11 @@ export default class LangIndicatorExtension extends Extension {
         this._inputSourceManager = null;
         this._ibusManager = null;
         this._panelService = null;
+        if (this._updateTimeoutId) {
+            GLib.source_remove(this._updateTimeoutId);
+            this._updateTimeoutId = 0;
+        }
+
         this._geometry = null;
         this._visible = false;
         this._lastAtspiAt = 0;
