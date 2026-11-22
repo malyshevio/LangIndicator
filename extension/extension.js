@@ -1,8 +1,9 @@
 // Lang Indicator — индикатор раскладки у курсора ввода (GNOME Shell, Wayland).
 //
-// Позиционирование — по IBus (set-cursor-location*): в логах координаты приходят
-// уже в stage-пространстве и точны. AT-SPI временно отключён для позиционирования
-// (давал нестабильное смещение); код оставлен под флагом для отдельной доработки.
+// Позиционирование: IBus (set-cursor-location*) даёт точные stage-координаты, но
+// приходит только при движении/вводе. AT-SPI дополняет — показывает позицию при
+// фокусе и на стрелках (IBus там молчит); используется, только если IBus недавно
+// не присылал позицию.
 //
 // Поведение: индикатор следует за кареткой, не исчезает; скрывается при потере
 // фокуса; при смене окна ждёт позицию новой каретки (не висит на прошлой).
@@ -78,6 +79,7 @@ export default class LangIndicatorExtension extends Extension {
         this._updateScheduled = false;
         this._updateTimeoutId = 0;
         this._lastAtspiAt = 0;
+        this._lastIbusAt = 0;
         this._windowActor = null;
         this._actorX = 0;
         this._actorY = 0;
@@ -149,6 +151,7 @@ export default class LangIndicatorExtension extends Extension {
         // Смена окна: сбрасываем геометрию, чтобы не показать на прошлом месте.
         this._geometry = null;
         this._lastAtspiAt = 0;
+        this._lastIbusAt = 0;
         this._hideIndicator();
     }
 
@@ -178,10 +181,6 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     _setGeometry(x, y, w, h, relative) {
-        if (this._lastAtspiAt &&
-            GLib.get_monotonic_time() - this._lastAtspiAt < 800000)
-            return;
-
         if (w === 0 && h === 0)
             return;
 
@@ -208,6 +207,7 @@ export default class LangIndicatorExtension extends Extension {
 
         this._geometry = rect;
         this._visible = true;
+        this._lastIbusAt = GLib.get_monotonic_time();
         if (DEBUG)
             log(`[LangIndicator] caret ${relative ? 'rel' : 'abs'} raw=${x},${y} -> ${rect.x},${rect.y}`);
         this._scheduleUpdate();
@@ -268,9 +268,15 @@ export default class LangIndicatorExtension extends Extension {
         try {
             const type = event?.type ?? '';
             const isCaret = type === 'object:text-caret-moved';
-            const isFocus = type.startsWith('object:state-changed') &&
+            const isFocus = type === 'object:state-changed:focused' &&
                 event.detail1 === 1;
             if (!isCaret && !isFocus)
+                return;
+
+            // IBus точнее и без задержки; AT-SPI — только если IBus молчит
+            // (фокус, стрелки). Не перебиваем свежую IBus-позицию.
+            if (this._lastIbusAt &&
+                GLib.get_monotonic_time() - this._lastIbusAt < 300000)
                 return;
 
             const accessible = event.source;
@@ -423,6 +429,7 @@ export default class LangIndicatorExtension extends Extension {
         this._geometry = null;
         this._visible = false;
         this._lastAtspiAt = 0;
+        this._lastIbusAt = 0;
         this._updateScheduled = false;
     }
 }
