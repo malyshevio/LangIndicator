@@ -22,6 +22,7 @@ import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keybo
 
 const CARET_MOVED = 'object:text-caret-moved';
 const ENABLE_ATSPI_FALLBACK = false;
+const DEBUG = false;
 
 const Indicator = class Indicator extends BoxPointer.BoxPointer {
     static {
@@ -173,7 +174,7 @@ export default class LangIndicatorExtension extends Extension {
         this._geometry.y += dy;
 
         if (this._visible)
-            this._updateIndicator();
+            this._scheduleUpdate();
     }
 
     _setGeometry(x, y, w, h, relative) {
@@ -192,16 +193,23 @@ export default class LangIndicatorExtension extends Extension {
         if (!focusWindow)
             return;
 
-        // Санити-чек: каретка должна быть в пределах окна фокуса. Отсекает
+        // Санити-чек: каретка должна быть в пределах окна фокуса. Опираемся на
+        // rect window actor (на него же опирается конвертация); отсекает
         // «запоздалые» события от предыдущего окна.
+        const winActor = focusWindow.get_compositor_private();
         const fr = focusWindow.get_frame_rect();
-        if (rect.x < fr.x - 16 || rect.x > fr.x + fr.width + 16 ||
-            rect.y < fr.y - 16 || rect.y > fr.y + fr.height + 16)
+        const bx = winActor ? winActor.x : fr.x;
+        const by = winActor ? winActor.y : fr.y;
+        const bw = winActor ? winActor.width : fr.width;
+        const bh = winActor ? winActor.height : fr.height;
+        if (rect.x < bx - 16 || rect.x > bx + bw + 16 ||
+            rect.y < by - 16 || rect.y > by + bh + 16)
             return;
 
         this._geometry = rect;
         this._visible = true;
-        log(`[LangIndicator] caret ${relative ? 'rel' : 'abs'} raw=${x},${y} -> ${rect.x},${rect.y}`);
+        if (DEBUG)
+            log(`[LangIndicator] caret ${relative ? 'rel' : 'abs'} raw=${x},${y} -> ${rect.x},${rect.y}`);
         this._scheduleUpdate();
     }
 
