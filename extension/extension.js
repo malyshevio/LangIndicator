@@ -77,7 +77,11 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager = getIBusManager();
         this._panelService = null;
         this._geometry = null;
+        this._visible = false;
         this._lastAtspiAt = 0;
+        this._windowActor = null;
+        this._actorX = 0;
+        this._actorY = 0;
 
         // IBus panel service создаётся асинхронно: подписываемся на ready.
         this._ibusManager.connectObject(
@@ -90,7 +94,48 @@ export default class LangIndicatorExtension extends Extension {
 
         // Смена окна — скрываем, пока не придёт позиция каретки нового окна.
         global.display.connectObject(
-            'notify::focus-window', () => this._hideIndicator(), this);
+            'notify::focus-window', () => this._onFocusWindowChanged(), this);
+        this._onFocusWindowChanged();
+    }
+
+    _onFocusWindowChanged() {
+        if (this._windowActor) {
+            this._windowActor.disconnectObject(this);
+            this._windowActor = null;
+        }
+
+        const win = global.display.focus_window;
+        const actor = win?.get_compositor_private();
+        if (actor) {
+            this._windowActor = actor;
+            this._actorX = actor.x;
+            this._actorY = actor.y;
+            actor.connectObject(
+                'notify::x', () => this._followWindow(),
+                'notify::y', () => this._followWindow(),
+                this);
+        }
+
+        this._hideIndicator();
+    }
+
+    // Каретка на экране смещается вместе с окном — сдвигаем позицию индикатора.
+    _followWindow() {
+        if (!this._windowActor || !this._geometry)
+            return;
+
+        const dx = this._windowActor.x - this._actorX;
+        const dy = this._windowActor.y - this._actorY;
+        if (dx === 0 && dy === 0)
+            return;
+
+        this._actorX = this._windowActor.x;
+        this._actorY = this._windowActor.y;
+        this._geometry.x += dx;
+        this._geometry.y += dy;
+
+        if (this._visible)
+            this._updateIndicator();
     }
 
     _syncPanelService() {
@@ -140,8 +185,11 @@ export default class LangIndicatorExtension extends Extension {
         if (!rect)
             return;
 
+        const fw = global.display.focus_window;
+        const fr = fw ? fw.get_frame_rect() : null;
         this._geometry = rect;
-        log(`[LangIndicator] caret ${relative ? 'rel' : 'abs'} raw=${x},${y},${w},${h} -> ${rect.x},${rect.y}`);
+        this._visible = true;
+        log(`[LangIndicator] caret ${relative ? 'rel' : 'abs'} raw=${x},${y} win=${fr ? `${fr.x},${fr.y}` : '?'} kf=${!!global.stage.key_focus} -> ${rect.x},${rect.y}`);
         this._updateIndicator();
     }
 
@@ -211,6 +259,7 @@ export default class LangIndicatorExtension extends Extension {
             }
             this._lastAtspiAt = GLib.get_monotonic_time();
             this._geometry = rect;
+            this._visible = true;
             log(`[LangIndicator] atspi caret -> ${rect.x},${rect.y}`);
             this._updateIndicator();
         } catch (e) {
@@ -274,13 +323,13 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     _hideIndicator() {
-        this._geometry = null;
+        this._visible = false;
         if (this._indicator)
             this._indicator.close(BoxPointer.PopupAnimation.NONE);
     }
 
     _updateIndicator() {
-        if (!this._geometry)
+        if (!this._geometry || !this._visible)
             return;
         const label = this._currentLayoutLabel();
         if (!label)
@@ -293,6 +342,8 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager?.disconnectObject(this);
         this._panelService?.disconnectObject(this);
         global.display?.disconnectObject(this);
+        this._windowActor?.disconnectObject(this);
+        this._windowActor = null;
 
         if (this._atspiListener) {
             try {
@@ -309,6 +360,7 @@ export default class LangIndicatorExtension extends Extension {
         this._ibusManager = null;
         this._panelService = null;
         this._geometry = null;
+        this._visible = false;
         this._lastAtspiAt = 0;
     }
 }
