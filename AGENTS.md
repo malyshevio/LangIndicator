@@ -52,12 +52,17 @@ cp extension/extension.js /tmp/extension.mjs && node --check /tmp/extension.mjs
 ```
 
 ## Development workflow (mandatory)
-Before delivering any code change, run two review subagents on model
+Before delivering any code change, run two subagents on model
 `opencode-go/mimo-v2.6-flash` and fix their findings before finishing:
 - **codereviewer** — agent `coder`: correctness, GNOME Shell API usage, crash risk.
-- **tester** — agent `general`: static verification + bug hunt; must run the
-  ESM `node --check` syntax check above and verify `metadata.json` uuid /
-  `shell-version` against `scripts/install.sh`.
+- **tester** — agent `general`: verification ONLY (not code review).
+  The tester must:
+  1. **First write a short test plan** (3–5 bullet hypotheses) and follow it.
+  2. Keep the hypothesis count small and stop once the plan is covered.
+  3. Run the ESM `node --check` syntax check above and verify `metadata.json`
+     `uuid` / `shell-version` against `scripts/install.sh`.
+  4. Report pass/fail per hypothesis. Do **not** re-review code or list
+     style/code-quality issues — that is the codereviewer's job.
 
 ## Versioning & commits
 - Conventional Commits: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`.
