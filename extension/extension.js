@@ -79,6 +79,7 @@ export default class LangIndicatorExtension extends Extension {
         this._geometry = null;
         this._visible = false;
         this._lastAtspiAt = 0;
+        this._updateScheduled = false;
         this._windowActor = null;
         this._actorX = 0;
         this._actorY = 0;
@@ -194,7 +195,7 @@ export default class LangIndicatorExtension extends Extension {
         this._geometry = rect;
         this._visible = true;
         log(`[LangIndicator] caret ${relative ? 'rel' : 'abs'} raw=${x},${y} win=${fr ? `${fr.x},${fr.y}` : '?'} kf=${!!global.stage.key_focus} -> ${rect.x},${rect.y}`);
-        this._updateIndicator();
+        this._scheduleUpdate();
     }
 
     // Перевод координат IBus в stage. Повторяет ui/ibusCandidatePopup.js.
@@ -265,7 +266,7 @@ export default class LangIndicatorExtension extends Extension {
             this._geometry = rect;
             this._visible = true;
             log(`[LangIndicator] atspi caret -> ${rect.x},${rect.y}`);
-            this._updateIndicator();
+            this._scheduleUpdate();
         } catch (e) {
             log(`[LangIndicator] atspi error: ${e.message}`);
         }
@@ -300,6 +301,22 @@ export default class LangIndicatorExtension extends Extension {
                 accessible.get_state_set().contains(Atspi.StateType.FOCUSED);
             if (!windowActive || !accessibleFocused)
                 return null;
+
+            // Только события приложения из текущего окна фокуса.
+            const focusWindow = global.display.focus_window;
+            if (focusWindow) {
+                const focusPid = focusWindow.get_pid();
+                if (focusPid > 0 && app) {
+                    let appPid = -1;
+                    try {
+                        appPid = app.get_process_id();
+                    } catch (e2) {
+                        appPid = -1;
+                    }
+                    if (appPid > 0 && appPid !== focusPid)
+                        return null;
+                }
+            }
         } catch (e) {
             return null;
         }
@@ -311,9 +328,18 @@ export default class LangIndicatorExtension extends Extension {
         const windowRect = focusWindow.get_client_content_rect();
         const scaleFactor =
             St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        const x = windowRect.x + (scaleFactor * extents.x);
+        const y = windowRect.y + (scaleFactor * extents.y);
+
+        // Санити-чек: каретка должна попадать в окно. AT-SPI для терминалов и
+        // больших текстовых буферов иногда даёт смещение за пределы окна.
+        if (x < windowRect.x - 8 || x > windowRect.x + windowRect.width + 8 ||
+            y < windowRect.y - 8 || y > windowRect.y + windowRect.height + 8)
+            return null;
+
         return {
-            x: windowRect.x + (scaleFactor * extents.x),
-            y: windowRect.y + (scaleFactor * extents.y),
+            x,
+            y,
             width: scaleFactor * extents.width,
             height: scaleFactor * extents.height,
         };
@@ -330,6 +356,17 @@ export default class LangIndicatorExtension extends Extension {
         this._visible = false;
         if (this._indicator)
             this._indicator.close(BoxPointer.PopupAnimation.NONE);
+    }
+
+    _scheduleUpdate() {
+        if (this._updateScheduled)
+            return;
+        this._updateScheduled = true;
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
+            this._updateScheduled = false;
+            this._updateIndicator();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _updateIndicator() {
@@ -366,5 +403,6 @@ export default class LangIndicatorExtension extends Extension {
         this._geometry = null;
         this._visible = false;
         this._lastAtspiAt = 0;
+        this._updateScheduled = false;
     }
 }
