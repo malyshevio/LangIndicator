@@ -86,6 +86,10 @@ export default class LangIndicatorExtension extends Extension {
         // Смена раскладки — обновляем текст индикатора.
         this._inputSourceManager.connectObject(
             'current-source-changed', () => this._updateIndicator(), this);
+
+        // Смена окна — скрываем, пока не придёт позиция каретки нового окна.
+        global.display.connectObject(
+            'notify::focus-window', () => this._hideIndicator(), this);
     }
 
     _syncPanelService() {
@@ -113,6 +117,10 @@ export default class LangIndicatorExtension extends Extension {
         } catch (e) {
             // Only recent IBus versions have support for this signal.
         }
+
+        // Потеря фокуса ввода (каретка пропала) — скрываем индикатор.
+        this._panelService.connectObject(
+            'focus-out', () => this._hideIndicator(), this);
     }
 
     _setGeometry(x, y, w, h, relative) {
@@ -127,7 +135,7 @@ export default class LangIndicatorExtension extends Extension {
             return;
 
         this._geometry = rect;
-        log(`[LangIndicator] caret @ ${rect.x},${rect.y} (${relative ? 'rel' : 'abs'})`);
+        log(`[LangIndicator] caret ${relative ? 'rel' : 'abs'} raw=${x},${y},${w},${h} -> ${rect.x},${rect.y}`);
         this._updateIndicator();
     }
 
@@ -252,6 +260,12 @@ export default class LangIndicatorExtension extends Extension {
         return src.shortName || '?';
     }
 
+    _hideIndicator() {
+        this._geometry = null;
+        if (this._indicator)
+            this._indicator.close(BoxPointer.PopupAnimation.NONE);
+    }
+
     _updateIndicator() {
         if (!this._geometry)
             return;
@@ -265,6 +279,7 @@ export default class LangIndicatorExtension extends Extension {
         this._inputSourceManager?.disconnectObject(this);
         this._ibusManager?.disconnectObject(this);
         this._panelService?.disconnectObject(this);
+        global.display?.disconnectObject(this);
 
         if (this._atspiListener) {
             try {
