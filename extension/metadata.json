@@ -2,8 +2,8 @@
   "uuid": "lang-indicator@malyshevio.github.io",
   "name": "Lang Indicator",
   "description": "Показывает индикатор текущей раскладки клавиатуры возле курсора ввода (каретки).",
-  "version": 1,
-  "version-name": "0.1.0",
+  "version": 2,
+  "version-name": "0.2.0",
   "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
   "url": "https://github.com/malyshevio/LangIndicator"
 }
