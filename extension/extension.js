@@ -23,7 +23,7 @@ import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keybo
 
 const CARET_MOVED = 'object:text-caret-moved';
 const ENABLE_ATSPI_FALLBACK = true;
-const DEBUG = false;
+const DEBUG = true;
 
 const Indicator = class Indicator extends BoxPointer.BoxPointer {
     static {
@@ -69,6 +69,7 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
 
 export default class LangIndicatorExtension extends Extension {
     enable() {
+        log('[LangIndicator] v0.4.1 enable');
         this._indicator = new Indicator();
         this._inputSourceManager = getInputSourceManager();
         this._ibusManager = getIBusManager();
