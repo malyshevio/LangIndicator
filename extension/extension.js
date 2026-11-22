@@ -131,8 +131,7 @@ export default class LangIndicatorExtension extends Extension {
         this._panelService.connectObject(
             'set-cursor-location', (_svc, x, y, w, h) => {
                 const focusWindow = global.display.focus_window;
-                if ((focusWindow?.get_id() ?? null) !== this._geometryWindowId)
-                    log(`[LangIndicator] caret (abs) window=${focusWindow?.get_id() ?? null} @ ${x},${y}`);
+                log(`[LangIndicator] caret (abs) window=${focusWindow?.get_id() ?? null} xywh=${x},${y},${w},${h}`);
                 let rect = new Mtk.Rectangle({x, y, width: w, height: h});
                 if (!global.stage.key_focus && focusWindow)
                     rect = focusWindow.protocol_to_stage_rect(rect);
@@ -152,8 +151,7 @@ export default class LangIndicatorExtension extends Extension {
                     const focusWindow = global.display.focus_window;
                     if (!focusWindow)
                         return;
-                    if (focusWindow.get_id() !== this._geometryWindowId)
-                        log(`[LangIndicator] caret (rel) window=${focusWindow.get_id()} @ ${x},${y}`);
+                    log(`[LangIndicator] caret (rel) window=${focusWindow.get_id()} xywh=${x},${y},${w},${h}`);
                     let rect = new Mtk.Rectangle({x, y, width: w, height: h});
                     rect = focusWindow.protocol_to_stage_rect(rect);
                     const windowActor = focusWindow.get_compositor_private();
