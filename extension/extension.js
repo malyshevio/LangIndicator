@@ -1,9 +1,9 @@
 // Lang Indicator — индикатор раскладки у курсора ввода (GNOME Shell, Wayland).
 //
-// Спринт 1: базовый индикатор.
-//   • отслеживание смены раскладки: getInputSourceManager → current-source-changed;
-//   • позиция каретки: IBus panel service (set-cursor-location*) + AT-SPI fallback;
-//   • оверлей BoxPointer с текстом «RU»/«EN» у каретки, автоскрытие ~1 с.
+// Текущее ТЗ (упрощённое):
+//   • показываем текущий язык («RU»/«EN») у каретки при ПЕРЕХОДЕ В НОВОЕ ОКНО;
+//   • ждём свежую позицию каретки нового окна (IBus set-cursor-location*) и
+//     показываем индикатор один раз.
 //
 // Подробности архитектуры — docs/research.md, план — в YouGile.
 
@@ -49,8 +49,7 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
     }
 
     // Названо animate(), а не show(): show() перекрыл бы Clutter.Actor.show(),
-    // который BoxPointer.open() вызывает внутри себя (рекурсивный вызов с
-    // пустым rect). Тот же приём — в Better IBus.
+    // который BoxPointer.open() вызывает внутри себя. Тот же приём — в Better IBus.
     animate(text, rect) {
         this._label.text = text;
 
@@ -93,26 +92,31 @@ export default class LangIndicatorExtension extends Extension {
         this._inputSourceManager = getInputSourceManager();
         this._ibusManager = getIBusManager();
         this._panelService = null;
-        this._lastGeometry = null;
-        this._geometryWindowId = null;
 
-        // Смена источника ввода (раскладки).
-        this._inputSourceManager.connectObject(
-            'current-source-changed', () => this._showCurrentLayout(), this);
+        this._geometry = null;
+        this._pendingFocus = false;
+        this._lastWindowId = global.display.focus_window?.get_id() ?? null;
 
-        // IBus panel service создаётся асинхронно: подписываемся на ready,
-        // чтобы подключиться к сигналам позиции, когда сервис будет готов.
+        // IBus panel service создаётся асинхронно: подписываемся на ready.
         this._ibusManager.connectObject(
             'ready', () => this._syncPanelService(), this);
         this._syncPanelService();
 
-        // Fallback: AT-SPI для приложений, не сообщающих позицию в IBus.
-        if (ENABLE_ATSPI_FALLBACK)
-            this._initAtspiFallback();
+        // Триггер: переход в новое окно.
+        global.display.connectObject(
+            'notify::focus-window', () => this._onFocusChanged(), this);
+    }
 
-        // На старте позиция каретки ещё неизвестна; индикатор появится при
-        // первой смене раскладки после получения позиции.
-        this._showCurrentLayout();
+    _onFocusChanged() {
+        const id = global.display.focus_window?.get_id() ?? null;
+        if (id === this._lastWindowId)
+            return;
+
+        this._lastWindowId = id;
+        this._geometry = null;
+        // Ждём свежую позицию каретки для нового окна.
+        this._pendingFocus = true;
+        log(`[LangIndicator] focus -> window=${id}, ждём позицию каретки`);
     }
 
     _syncPanelService() {
@@ -127,47 +131,65 @@ export default class LangIndicatorExtension extends Extension {
 
         this._panelService = service;
 
-        // Абсолютная позиция каретки. Логика — как в ui/ibusCandidatePopup.js.
         this._panelService.connectObject(
             'set-cursor-location', (_svc, x, y, w, h) => {
-                const focusWindow = global.display.focus_window;
-                log(`[LangIndicator] caret (abs) window=${focusWindow?.get_id() ?? null} xywh=${x},${y},${w},${h}`);
-                let rect = new Mtk.Rectangle({x, y, width: w, height: h});
-                if (!global.stage.key_focus && focusWindow)
-                    rect = focusWindow.protocol_to_stage_rect(rect);
-                this._lastGeometry = {
-                    x: Math.round(rect.x),
-                    y: Math.round(rect.y),
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height),
-                };
-                this._geometryWindowId = focusWindow ? focusWindow.get_id() : null;
+                log(`[LangIndicator] caret (abs) xywh=${x},${y},${w},${h}`);
+                this._setGeometry(x, y, w, h, false);
             }, this);
 
-        // Относительная позиция (Wayland-клиенты). Сигнал есть не во всех IBus.
         try {
             this._panelService.connectObject(
                 'set-cursor-location-relative', (_svc, x, y, w, h) => {
-                    const focusWindow = global.display.focus_window;
-                    if (!focusWindow)
-                        return;
-                    log(`[LangIndicator] caret (rel) window=${focusWindow.get_id()} xywh=${x},${y},${w},${h}`);
-                    let rect = new Mtk.Rectangle({x, y, width: w, height: h});
-                    rect = focusWindow.protocol_to_stage_rect(rect);
-                    const windowActor = focusWindow.get_compositor_private();
-                    // IBus GtkIMModule не знает о масштабе Shell.
-                    const scale = windowActor.get_resource_scale();
-                    this._lastGeometry = {
-                        x: Math.round(windowActor.x + (rect.x / scale)),
-                        y: Math.round(windowActor.y + (rect.y / scale)),
-                        width: Math.round(rect.width / scale),
-                        height: Math.round(rect.height / scale),
-                    };
-                    this._geometryWindowId = focusWindow ? focusWindow.get_id() : null;
+                    log(`[LangIndicator] caret (rel) xywh=${x},${y},${w},${h}`);
+                    this._setGeometry(x, y, w, h, true);
                 }, this);
         } catch (e) {
             // Only recent IBus versions have support for this signal.
         }
+    }
+
+    _setGeometry(x, y, w, h, relative) {
+        const rect = this._toStage(x, y, w, h, relative);
+        if (!rect)
+            return;
+
+        this._geometry = rect;
+
+        if (this._pendingFocus) {
+            this._pendingFocus = false;
+            this._showIndicator();
+        }
+    }
+
+    // Перевод координат IBus в stage. Повторяет ui/ibusCandidatePopup.js.
+    _toStage(x, y, w, h, relative) {
+        const focusWindow = global.display.focus_window;
+        if (!focusWindow)
+            return null;
+
+        let rect = new Mtk.Rectangle({x, y, width: w, height: h});
+
+        if (relative) {
+            rect = focusWindow.protocol_to_stage_rect(rect);
+            const windowActor = focusWindow.get_compositor_private();
+            if (!windowActor)
+                return null;
+            // IBus GtkIMModule не знает о масштабе Shell.
+            const scale = windowActor.get_resource_scale();
+            rect.x = windowActor.x + (rect.x / scale);
+            rect.y = windowActor.y + (rect.y / scale);
+            rect.width /= scale;
+            rect.height /= scale;
+        } else if (!global.stage.key_focus) {
+            rect = focusWindow.protocol_to_stage_rect(rect);
+        }
+
+        return {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+        };
     }
 
     _initAtspiFallback() {
@@ -197,17 +219,18 @@ export default class LangIndicatorExtension extends Extension {
                 text.get_caret_offset(), Atspi.CoordType.WINDOW);
             const rect = this._convertExtentsToScreenSpace(accessible, extents);
             if (rect) {
-                this._lastGeometry = rect;
-                this._geometryWindowId =
-                    global.display.focus_window?.get_id() ?? null;
+                this._geometry = rect;
+                if (this._pendingFocus) {
+                    this._pendingFocus = false;
+                    this._showIndicator();
+                }
             }
         } catch (e) {
             // Игнорируем отдельные события без корректных extents.
         }
     }
 
-    // Перевод extents из window-координат AT-SPI в stage-координаты Shell.
-    // Логика повторяет magnifier.js (GNOME Shell).
+    // Перевод extents из window-координат AT-SPI в stage. Логика magnifier.js.
     _convertExtentsToScreenSpace(accessible, extents) {
         const toplevelWindowTypes = new Set(
             [Atspi.Role.FRAME, Atspi.Role.DIALOG, Atspi.Role.WINDOW]);
@@ -262,33 +285,22 @@ export default class LangIndicatorExtension extends Extension {
         return src.shortName || '?';
     }
 
-    _showCurrentLayout() {
-        const g = this._lastGeometry;
-        const focusWindow = global.display.focus_window;
-
-        if (!g || this._geometryWindowId === null) {
-            log('[LangIndicator] show: нет позиции каретки');
+    _showIndicator() {
+        if (!this._geometry)
             return;
-        }
-        // Показываем только если позиция принадлежит текущему окну фокуса.
-        const focusId = focusWindow ? focusWindow.get_id() : null;
-        if (this._geometryWindowId !== focusId) {
-            log(`[LangIndicator] show: позиция от другого окна (geom=${this._geometryWindowId} focus=${focusId}), пропускаю`);
-            return;
-        }
-
         const label = this._currentLayoutLabel();
         if (!label)
             return;
 
-        log(`[LangIndicator] show "${label}" @ ${g.x},${g.y}`);
-        this._indicator.animate(label, g);
+        log(`[LangIndicator] show "${label}" @ ${this._geometry.x},${this._geometry.y},${this._geometry.width},${this._geometry.height}`);
+        this._indicator.animate(label, this._geometry);
     }
 
     disable() {
         this._inputSourceManager?.disconnectObject(this);
         this._ibusManager?.disconnectObject(this);
         this._panelService?.disconnectObject(this);
+        global.display?.disconnectObject(this);
 
         if (this._atspiListener) {
             try {
@@ -304,7 +316,8 @@ export default class LangIndicatorExtension extends Extension {
         this._inputSourceManager = null;
         this._ibusManager = null;
         this._panelService = null;
-        this._lastGeometry = null;
-        this._geometryWindowId = null;
+        this._geometry = null;
+        this._pendingFocus = false;
+        this._lastWindowId = null;
     }
 }
