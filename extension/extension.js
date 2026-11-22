@@ -182,12 +182,6 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     _setGeometry(x, y, w, h, relative) {
-        // AT-SPI даёт текущую позицию, IBus — на шаг позади. Если AT-SPI недавно
-        // присылал позицию, IBus не перебиваем (иначе индикатор «запаздывает»).
-        if (this._lastAtspiAt &&
-            GLib.get_monotonic_time() - this._lastAtspiAt < 300000)
-            return;
-
         if (w === 0 && h === 0)
             return;
 
@@ -284,8 +278,11 @@ export default class LangIndicatorExtension extends Extension {
             const text = accessible?.get_text_iface();
             if (!text)
                 return;
+            // Для caret-moved берём offset из события (detail1) — запрос
+            // get_caret_offset() может вернуть устаревший (на шаг позади).
+            const caretOffset = isCaret ? event.detail1 : text.get_caret_offset();
             const extents = text.get_character_extents(
-                text.get_caret_offset(), Atspi.CoordType.WINDOW);
+                caretOffset, Atspi.CoordType.WINDOW);
             if (!extents || (extents.width === 0 && extents.height === 0))
                 return;
             const rect = this._convertExtentsToScreenSpace(accessible, extents, isFocus);
@@ -321,8 +318,16 @@ export default class LangIndicatorExtension extends Extension {
                 iter = iter.get_parent();
             }
 
-            if (app && app.get_name() === 'gnome-shell')
-                return null;
+            if (app && app.get_name() === 'gnome-shell') {
+                // Свои (shell) extents уже в stage-координатах — возвращаем как есть,
+                // чтобы индикатор работал в поиске приложений и диалогах GNOME.
+                return {
+                    x: extents.x,
+                    y: extents.y,
+                    width: extents.width,
+                    height: extents.height,
+                };
+            }
 
             // Для focus-события доверяем самому событию (элемент только что
             // получил фокус) — a11y-состояния ACTIVE/FOCUSED в кеше могут
