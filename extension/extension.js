@@ -21,8 +21,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 
 const CARET_MOVED = 'object:text-caret-moved';
-// Глобальный AT-SPI listener может ронять сессию (нативный крэш). Временно
-// отключён — включить обратно только после диагностики по журналу.
+// AT-SPI — приоритетный источник каретки (ловит стрелки/backspace/клик).
+// Сессия с ним стабильна при visible=false.
 const ENABLE_ATSPI_FALLBACK = true;
 
 const Indicator = class Indicator extends BoxPointer.BoxPointer {
@@ -111,6 +111,7 @@ export default class LangIndicatorExtension extends Extension {
 
         const win = global.display.focus_window;
         const actor = win?.get_compositor_private();
+        log(`[LangIndicator] focus window=${win ? win.get_id() : 'null'}`);
         if (actor) {
             this._windowActor = actor;
             this._actorX = actor.x;
@@ -121,6 +122,7 @@ export default class LangIndicatorExtension extends Extension {
                 this);
         }
 
+        this._lastAtspiAt = 0;
         this._hideIndicator();
     }
 
@@ -232,8 +234,10 @@ export default class LangIndicatorExtension extends Extension {
     _initAtspiFallback() {
         this._atspiListener = null;
         try {
-            if (Atspi.init() !== 0) {
-                log('[LangIndicator] AT-SPI недоступен');
+            // atspi_init(): 0 — успех, 1 — уже инициализирован (не ошибка).
+            const initRet = Atspi.init();
+            if (initRet !== 0 && initRet !== 1) {
+                log(`[LangIndicator] AT-SPI недоступен (init=${initRet})`);
                 return;
             }
             Atspi.set_timeout(250, 250);
@@ -257,6 +261,9 @@ export default class LangIndicatorExtension extends Extension {
             }
             const extents = text.get_character_extents(
                 text.get_caret_offset(), Atspi.CoordType.WINDOW);
+            // Как в magnifier: пустые extents (0x0) — нет валидной позиции.
+            if (!extents || (extents.width === 0 && extents.height === 0))
+                return;
             const rect = this._convertExtentsToScreenSpace(accessible, extents);
             if (!rect) {
                 log('[LangIndicator] atspi: позиция отфильтрована/пустая');
@@ -325,16 +332,18 @@ export default class LangIndicatorExtension extends Extension {
         if (!focusWindow)
             return null;
 
-        const windowRect = focusWindow.get_client_content_rect();
+        // AT-SPI extents (CoordType.WINDOW) отсчитываются от рамки окна
+        // (включая заголовок/headerbar). Берём get_frame_rect(), а не
+        // client_content_rect() — иначе индикатор уезжает вниз на высоту шапки.
+        const frameRect = focusWindow.get_frame_rect();
         const scaleFactor =
             St.ThemeContext.get_for_stage(global.stage).scale_factor;
-        const x = windowRect.x + (scaleFactor * extents.x);
-        const y = windowRect.y + (scaleFactor * extents.y);
+        const x = frameRect.x + (scaleFactor * extents.x);
+        const y = frameRect.y + (scaleFactor * extents.y);
 
-        // Санити-чек: каретка должна попадать в окно. AT-SPI для терминалов и
-        // больших текстовых буферов иногда даёт смещение за пределы окна.
-        if (x < windowRect.x - 8 || x > windowRect.x + windowRect.width + 8 ||
-            y < windowRect.y - 8 || y > windowRect.y + windowRect.height + 8)
+        // Санити-чек: каретка должна попадать в окно.
+        if (x < frameRect.x - 8 || x > frameRect.x + frameRect.width + 8 ||
+            y < frameRect.y - 8 || y > frameRect.y + frameRect.height + 8)
             return null;
 
         return {
@@ -349,7 +358,7 @@ export default class LangIndicatorExtension extends Extension {
         const src = this._inputSourceManager.currentSource;
         if (!src)
             return '';
-        return src.shortName || '?';
+        return (src.shortName || '?').toUpperCase();
     }
 
     _hideIndicator() {
