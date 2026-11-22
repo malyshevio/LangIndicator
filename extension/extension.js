@@ -88,6 +88,10 @@ export default class LangIndicatorExtension extends Extension {
             'ready', () => this._syncPanelService(), this);
         this._syncPanelService();
 
+        // AT-SPI — приоритетный источник позиции каретки.
+        if (ENABLE_ATSPI_FALLBACK)
+            this._initAtspiFallback();
+
         // Смена раскладки — обновляем текст индикатора.
         this._inputSourceManager.connectObject(
             'current-source-changed', () => this._updateIndicator(), this);
