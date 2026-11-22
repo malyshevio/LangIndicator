@@ -187,6 +187,7 @@ export default class LangIndicatorExtension extends Extension {
             this._atspiListener =
                 Atspi.EventListener.new(this._onAtspiCaretMoved.bind(this));
             this._atspiListener.register(CARET_MOVED);
+            log('[LangIndicator] AT-SPI listener registered');
         } catch (e) {
             log(`[LangIndicator] AT-SPI fallback выключен: ${e.message}`);
             this._atspiListener = null;
@@ -197,19 +198,23 @@ export default class LangIndicatorExtension extends Extension {
         try {
             const accessible = event.source;
             const text = accessible?.get_text_iface();
-            if (!text)
+            if (!text) {
+                log('[LangIndicator] atspi: событие без text-интерфейса');
                 return;
+            }
             const extents = text.get_character_extents(
                 text.get_caret_offset(), Atspi.CoordType.WINDOW);
             const rect = this._convertExtentsToScreenSpace(accessible, extents);
-            if (rect) {
-                this._lastAtspiAt = GLib.get_monotonic_time();
-                this._geometry = rect;
-                log(`[LangIndicator] atspi caret -> ${rect.x},${rect.y}`);
-                this._updateIndicator();
+            if (!rect) {
+                log('[LangIndicator] atspi: позиция отфильтрована/пустая');
+                return;
             }
+            this._lastAtspiAt = GLib.get_monotonic_time();
+            this._geometry = rect;
+            log(`[LangIndicator] atspi caret -> ${rect.x},${rect.y}`);
+            this._updateIndicator();
         } catch (e) {
-            // Игнорируем отдельные события без корректных extents.
+            log(`[LangIndicator] atspi error: ${e.message}`);
         }
     }
 
