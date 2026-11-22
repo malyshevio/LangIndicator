@@ -149,6 +149,12 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     _setGeometry(x, y, w, h, relative) {
+        // IBus может прислать «пустую» позицию 0,0,0,0 до того, как узнает
+        // каретку. Реальный прямоугольник каретки имеет ненулевую высоту
+        // (ширина может быть 0 — это вертикальная черта).
+        if (w === 0 && h === 0)
+            return;
+
         const rect = this._toStage(x, y, w, h, relative);
         if (!rect)
             return;
