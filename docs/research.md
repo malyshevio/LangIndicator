@@ -5,12 +5,13 @@
 
 ## Вывод (коротко)
 
-В GNOME Shell позицию каретки можно получить **изнутри композитора** двумя способами:
+В GNOME Shell позицию каретки можно получить **изнутри композитора** двумя
+способами, но в расширении используется только первый:
 
-1. **IBus panel service** (основной, рекомендованный) — сигналы
+1. **IBus panel service** (единственный используемый) — сигналы
    `set-cursor-location` / `set-cursor-location-relative`.
-2. **AT-SPI** (fallback) — события `object:text-caret-moved` +
-   `atspi_text_get_character_extents`.
+2. **AT-SPI** — исследован и отвергнут (см. §3): a11y-каретка отдаётся
+   нестабильно.
 
 Обычное Wayland-приложение эти данные не получит (изоляция композитора),
 поэтому GUI-слой — расширение GNOME Shell.
@@ -70,6 +71,30 @@ boxpointer.setPosition(dummyCursor, 0);
 Main.layoutManager.addTopChrome(boxpointer);
 ```
 
+В текущей реализации `BoxPointer` не используется: его `-boxpointer-gap`
+по умолчанию нулевой, поэтому «чип» ложится прямо на каретку/текст. Вместо
+этого — `St.BoxLayout` в chrome-слое, `set_position()` которого ставит индикатор
+**правее и ниже каретки** (а если там не помещается — в остальные углы вокруг
+неё, в крайнем случае по центру над строкой).
+
+### Фокус текстового поля
+
+`IBusManager` переизлучает сигналы `IBus.PanelService` (Shell 51,
+`js/misc/ibusManager.js`):
+
+```js
+this._panelService.connect('focus-in', (panel, path) => {
+    if (!GLib.str_has_suffix(path, '/InputContext_1')) // свой контекст Shell
+        this.emit('focus-in');
+});
+this._panelService.connect('focus-out', () => this.emit('focus-out'));
+```
+
+`focus-out` приходит и при смене окна, и когда текстовое поле теряет фокус
+внутри одного окна (Tab на неактивный элемент, клик по пустому месту).
+`ibusCandidatePopup.js` по нему закрывает кандидатный попап; расширение по
+нему прячет индикатор, а по `focus-in` показывает его из кэша окна.
+
 ## 2. kimpanel (протокол org.kde.impanel)
 
 Расширение
@@ -86,7 +111,7 @@ Main.layoutManager.addTopChrome(boxpointer);
 Подтверждает: координаты каретки доступны только внутри композитора — ИМ
 присылает их по D-Bus, а расширение переводит в stage-координаты.
 
-## 3. AT-SPI (fallback)
+## 3. AT-SPI (исследован, отвергнут)
 
 Событие `object:text-caret-moved` и `atspi_text_get_character_extents` дают
 прямоугольник каретки. Так каретку отслеживает GNOME Shell Magnifier. Доступно
@@ -99,18 +124,22 @@ a11y-каретку; есть известные баги (mutter#3963 — не�
 
 ## 4. Рекомендация для Спринта 1
 
-1. **Основной путь** — IBus panel service (`set-cursor-location*`): просто,
-   уже встроено в Shell, работает для приложений, сообщающих позицию в ИМ
-   (GTK/Qt с IBus IM-модулем).
-2. **Fallback** — AT-SPI (`text-caret-moved`), для приложений без IBus-позиции.
+1. **Единственный источник** — IBus panel service (`set-cursor-location*`):
+   просто, уже встроено в Shell, работает для приложений, сообщающих позицию
+   в ИМ (GTK/Qt с IBus IM-модулем).
+2. **AT-SPI не используем:** a11y-каретка отдаётся нестабильно и давала ложные
+   позиции (см. §3).
 3. Смену раскладки ловим через
    `getInputSourceManager().connectObject('current-source-changed', …)`.
-4. Оверлей — `BoxPointer.BoxPointer` + dummy-актор + `addTopChrome`, чтобы не
-   перехватывать фокус ввода.
+4. Оверлей — `St.BoxLayout` + `addTopChrome`: `set_position()` ставит индикатор
+   правее и ниже каретки, чтобы он не перекрывал каретку и текст; если там не
+   помещается — другие углы вокруг каретки.
+5. Фокус поля ввода ловим через `IBusManager` (`focus-in` / `focus-out`):
+   потеря фокуса полем без смены окна тоже скрывает индикатор.
 
 ## Известные ограничения
 
-- Позиция есть только пока приложение сообщает её в ИМ или a11y; для остальных
+- Позиция есть только пока приложение сообщает её в ИМ (IBus); для остальных
   индикатор не показываем (не у курсора мыши).
 - Возможны задержки обновления позиции (Better IBus ставит debounce 50 мс на
   `notify::focus-window`).

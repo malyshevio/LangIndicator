@@ -10,17 +10,19 @@ Wayland client cannot read another app's caret position (compositor isolation).
 See `docs/research.md` for reasoning and API sources.
 
 ## Architecture (current model)
-- **AT-SPI primary** via Shell's `FocusCaretTracker` (`ui/focusCaretTracker.js`,
-  the same module `magnifier.js` uses). Gives current caret position on
-  focus/arrows/backspace.
-- **IBus fallback** (`set-cursor-location*` on `getIBusManager()._panelService`).
-  Only used while AT-SPI hasn't positioned the current window; ignored
-  afterward (IBus lags one report and misses focus-only events).
-- **Single source per window** — no priority flip-flop, no jitter.
+- **IBus only** (`set-cursor-location*` on `getIBusManager()._panelService`).
+  Gives accurate stage coordinates whenever the app reports a caret (GTK/Qt
+  with an IM module). This is the baseline that worked in v0.2.0.
+- **No AT-SPI fallback** (dropped in 0.6.0). Without an IBus event the indicator
+  stays hidden; the mouse pointer is never used as a fallback.
+- **Never overlap the caret.** The chip goes **above** the caret line with a gap
+  (`CARET_GAP`), flips below the line only when it doesn't fit above, and is
+  clamped to the monitor work area. No `BoxPointer`, no arrow — plain
+  `St.BoxLayout` positioned with `set_position()`.
 - **Hide on focus loss / window change.** Per-window caret cache lets the
   indicator reappear instantly on return.
-- Coordinate conversion: AT-SPI `get_character_extents(WINDOW)` +
-  `focusWindow.get_client_content_rect()` + `scaleFactor` — mirrors `magnifier.js`.
+- Coordinate conversion mirrors `ui/ibusCandidatePopup.js`
+  (`protocol_to_stage_rect()` + window actor scale for `-relative`).
 
 ## No build system
 No package.json, Makefile, test runner, linter, or CI. The extension is plain
@@ -41,11 +43,15 @@ ESM JS loaded by GNOME Shell. Don't reach for `npm`/`make`/`test`.
 - **`shell-version`** gates loading. When targeting a new GNOME release, add
   its version to `metadata.json` or the extension won't enable.
 - Uses **private GNOME Shell APIs** (no public API for caret position):
-  `FocusCaretTracker`, `getIBusManager()._panelService`,
-  `getInputSourceManager()`, `Main.layoutManager.addTopChrome`. Follow
-  `magnifier.js` / `ibusCandidatePopup.js` patterns rather than "cleaning up".
-- `BoxPointer.close()` triggers an animation that can hide a re-opened popup
-  — use `visible = false` directly (the method is `dismiss()`, not `hide()`).
+  `getIBusManager()._panelService`, `getInputSourceManager()`,
+  `Main.layoutManager.addTopChrome`. Follow `ibusCandidatePopup.js` patterns
+  rather than "cleaning up".
+- Chrome actors added with `addTopChrome()` live in `uiGroup` (fixed layout):
+  `set_position()`/`set_size()` stick, no constraints needed. Name the methods
+  `update()`/`dismiss()` so they don't shadow `Clutter.Actor.show()`/`hide()`;
+  toggle with `visible = …`.
+- Chip height is measured with `get_preferred_size()`; a `FALLBACK_HEIGHT`
+  floor keeps a not-yet-measured chip from landing on the caret.
 
 ## Dev loop (requires a real GNOME Shell Wayland session)
 ```bash
@@ -63,8 +69,10 @@ cp extension/extension.js /tmp/extension.mjs && node --check /tmp/extension.mjs
 
 ## Development workflow
 For behavior changes, new API usage, or lifecycle changes: run codereviewer
-(agent `coder`) + tester (agent `general`) on model `opencode-go/mimo-v2.6-flash`
-with a focused brief (≤ 3 bullets from the diff). Trivial changes (typos,
+(agent `coder`) + tester (agent `general`) on model `opencode-go/gpt-6-luna`
+with a focused brief (≤ 3 bullets from the diff). Demand a terse review: a
+numbered list of concrete findings with line numbers and a one-line fix each —
+no preamble, no restating the code, no long reasoning. Trivial changes (typos,
 comments, version bumps): syntax check only. Refactors: tester only.
 Subagents are read-only — they must not edit files. Fix their findings before
 committing.

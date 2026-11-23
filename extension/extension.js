@@ -1,24 +1,25 @@
 // Lang Indicator — индикатор раскладки у курсора ввода (GNOME Shell, Wayland).
 //
-// Модель позиционирования — одна и детерминированная (никаких «кто победил»):
-//   • AT-SPI — основной источник: события caret-moved/focused дают ТЕКУЩУЮ
-//     позицию каретки; работают при фокусе, на стрелках и backspace;
-//   • IBus (set-cursor-location*) — запасной источник для приложений без a11y.
-//     IBus не присылает позицию при простом фокусе и отстаёт на один отчёт,
-//     поэтому как только AT-SPI дал позицию для текущего окна, IBus для этого
-//     окна игнорируется — иначе индикатор прыгает между двумя источниками;
-//   • при смене окна/потере фокуса индикатор скрывается и ждёт позицию нового
-//     окна (не висит на каретке прошлого окна); последняя позиция каретки
-//     запоминается по окнам, чтобы при возврате показать сразу;
-//   • текст («RU»/«EN») обновляется при смене раскладки.
+// Единственный источник позиции каретки — IBus panel service
+// (`set-cursor-location` / `set-cursor-location-relative`). Он даёт точные
+// stage-координаты, пока приложение сообщает их input-method (GTK/Qt с
+// IBus-модулем). AT-SPI больше не используется: без события IBus индикатор
+// не показывается, позиция мыши не подставляется никогда.
 //
-// AT-SPI слушаем через штатный FocusCaretTracker (тот же, что в magnifier.js),
-// а не собственным листенером — меньше шансов уронить сессию.
+// Индикатор не налезает на каретку: основной вариант — ПРАВЕЕ и НИЖЕ неё,
+// чтобы не закрывать ни каретку, ни строку, в которой печатают. Если там не
+// помещается, перебираются остальные углы вокруг каретки (справа-сверху,
+// слева-снизу, слева-сверху), и только в крайнем случае — прежняя схема «по
+// центру над строкой» (или под ней, если сверху нет места). Позиция
+// ограничена рабочей областью монитора (кроме случая, когда «чип» шире неё).
 //
-// Подробности — docs/research.md, план — в YouGile.
+// При смене окна/потере фокуса индикатор скрывается; при потере фокуса самим
+// текстовым полем внутри того же окна (IBus focus-out) — тоже. Последняя
+// позиция каретки запоминается по окнам вместе с признаком «поле было в
+// фокусе», чтобы при возврате в окно показать сразу.
+//
+// Подробности — docs/research.md, задачи — в YouGile (проект LangIndicator).
 
-import Atspi from 'gi://Atspi';
-import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Mtk from 'gi://Mtk';
@@ -26,77 +27,145 @@ import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {getIBusManager} from 'resource:///org/gnome/shell/misc/ibusManager.js';
-import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
-import {FocusCaretTracker} from 'resource:///org/gnome/shell/ui/focusCaretTracker.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 
-const CARET_MOVED = 'object:text-caret-moved';
-const FOCUS_CHANGED = 'object:state-changed:focused';
-// Склейка частых событий AT-SPI/IBus в один relayout.
-// Минимальная задержка для снижения нагрузки, но достаточно быстрая, чтобы не отставать.
-const UPDATE_DELAY_MS = 8;
+// Склейка частых событий IBus/смены раскладки в один relayout (~60 Гц).
+const UPDATE_DELAY_MS = 16;
+// Отступ между кареткой и «чипом»: гарантия, что индикатор не закрывает ни
+// каретку, ни строку, в которой печатают.
+const CARET_GAP = 6;
+// Минимальный отступ от края рабочей области, чтобы «чип» не лип к кромке.
+const EDGE_MARGIN = 4;
 // Допуск при проверке «каретка внутри окна фокуса»: отсекает запоздалые
-// события предыдущего окна, но не спотыкается на тени/декорациях и на
-// расхождении origin у разных приложений.
-const BOUNDS_MARGIN = 128;
+// события предыдущего окна, но не спотыкается на тени/декорациях.
+const BOUNDS_MARGIN = 12;
+// Страховка, если высота «чипа» ещё не посчитана (стиль не применился):
+// без неё индикатор мог бы лечь на каретку.
+const FALLBACK_HEIGHT = 24;
+// Если IBus не сообщил высоту каретки — считаем её обычной строкой текста.
+// При крупном шрифте реальная строка выше, и «чип» под ней может задеть её
+// низ; это касается только приложений, присылающих h = 0.
+const FALLBACK_CARET_HEIGHT = 16;
 
-const Indicator = class Indicator extends BoxPointer.BoxPointer {
+const Indicator = class Indicator extends St.BoxLayout {
     static {
         GObject.registerClass(this);
     }
 
     constructor() {
-        super(St.Side.LEFT);
-        this._isOpen = false;
-        this.visible = false;
-        this.add_style_class_name('lang-indicator-boxpointer');
+        super({
+            style_class: 'lang-indicator-content',
+            visible: false,
+        });
+        this._caret = null;
 
-        // «Dummy»-актор задаёт точку привязки BoxPointer к каретке.
-        this._dummyCursor = new Clutter.Actor({opacity: 0});
-        Main.layoutManager.uiGroup.add_child(this._dummyCursor);
-        Main.layoutManager.addTopChrome(this);
-
-        const box = new St.BoxLayout({style_class: 'lang-indicator-content'});
-        this.bin.set_child(box);
         this._label = new St.Label({style_class: 'lang-indicator-label'});
-        box.add_child(this._label);
+        this.add_child(this._label);
+
+        // Верхний chrome-слой: выше окон, не перехватывает фокус ввода.
+        Main.layoutManager.addTopChrome(this);
     }
 
-    // Названо не show(), чтобы не перекрыть Clutter.Actor.show(), который
-    // BoxPointer.open() вызывает внутри себя.
-    update(text, rect) {
+    // Названо не show(), чтобы не перекрыть Clutter.Actor.show().
+    update(text, caret) {
         this._label.text = text;
-        this._dummyCursor.set_position(rect.x, rect.y);
-        this._dummyCursor.set_size(
-            rect.width > 0 ? rect.width : 1,
-            rect.height > 0 ? rect.height : 1);
-        this.setPosition(this._dummyCursor, 0);
-
-        if (this._isOpen)
-            return;
-
-        this._isOpen = true;
-        this.open(BoxPointer.PopupAnimation.NONE);
+        this._caret = caret;
+        // Показываем до замера: размер считаем уже с новым текстом, в том же
+        // кадре, поэтому промежуточной отрисовки не будет.
+        this.visible = true;
+        this._relayout();
     }
 
-    // Не hide(): он перекрыл бы Clutter.Actor.hide(), который BoxPointer.close()
-    // вызывает внутри себя.
-    dismiss() {
-        if (!this._isOpen)
+    _relayout() {
+        if (!this._caret)
             return;
 
-        this._isOpen = false;
-        // Прячем актёра напрямую: close() запускает анимацию и может скрыть
-        // заново уже переоткрытый индикатор (гонка при смене окна).
+        const [, , naturalWidth, naturalHeight] = this.get_preferred_size();
+        // Меньше реальной высоты — никогда: завышенный размер только
+        // увеличит отступ, а заниженный мог бы наложить «чип» на каретку.
+        const height = Math.max(naturalHeight, FALLBACK_HEIGHT);
+        const {x, y} = this._place(naturalWidth, height);
+        this.set_position(x, y);
+    }
+
+    // Ставим «чип» правее и ниже каретки — это основной вариант: он не
+    // перекрывает ни каретку, ни строку, в которой печатают. Если справа
+    // или снизу нет места, перебираем остальные углы вокруг каретки, и
+    // только если не влезает ни один — падаем на «по центру над строкой».
+    _place(width, height) {
+        const caret = this._caret;
+        const workArea = this._workAreaAt(caret.x, caret.y);
+        const caretHeight = caret.height > 0 ? caret.height : FALLBACK_CARET_HEIGHT;
+        const caretWidth = Math.max(caret.width, 0);
+
+        // Границы рабочей области, внутри которых «чип» должен лежать целиком.
+        const minX = workArea.x + EDGE_MARGIN;
+        const minY = workArea.y + EDGE_MARGIN;
+        const maxX = workArea.x + workArea.width - EDGE_MARGIN;
+        const maxY = workArea.y + workArea.height - EDGE_MARGIN;
+
+        const rightX = caret.x + caretWidth + CARET_GAP;
+        const leftX = caret.x - width - CARET_GAP;
+        const belowY = caret.y + caretHeight + CARET_GAP;
+        const aboveY = caret.y - height - CARET_GAP;
+
+        const candidates = [
+            [rightX, belowY], // правее и ниже — основной
+            [rightX, aboveY], // поле у нижней кромки (чаты, мессенджеры)
+            [leftX, belowY],  // каретка у правого края
+            [leftX, aboveY],
+        ];
+
+        for (const [rawX, rawY] of candidates) {
+            const x = Math.round(rawX);
+            const y = Math.round(rawY);
+            if (x >= minX && y >= minY && x + width <= maxX && y + height <= maxY)
+                return {x, y};
+        }
+
+        return this._placeCentered(width, height, caret, caretHeight, workArea);
+    }
+
+    // Запасная схема: по центру каретки над строкой, иначе под строкой.
+    // Нужна, когда «чип» шире рабочей области и ни один угол не подошёл.
+    _placeCentered(width, height, caret, caretHeight, workArea) {
+        let x = caret.x + (Math.max(caret.width, 0) / 2) - (width / 2);
+        x = Math.max(workArea.x + EDGE_MARGIN,
+            Math.min(x, workArea.x + workArea.width - width - EDGE_MARGIN));
+
+        let y = caret.y - height - CARET_GAP;
+        if (y < workArea.y + EDGE_MARGIN)
+            y = caret.y + caretHeight + CARET_GAP;
+
+        y = Math.max(workArea.y + EDGE_MARGIN,
+            Math.min(y, workArea.y + workArea.height - height - EDGE_MARGIN));
+
+        // Кламп мог загнать «чип» на строку каретки (если он выше половины
+        // рабочей области). Перекрыть кромку экрана лучше, чем каретку.
+        if (y + height > caret.y && y < caret.y + caretHeight)
+            y = caret.y - height - CARET_GAP;
+
+        return {x: Math.round(x), y: Math.round(y)};
+    }
+
+    // Рабочая область монитора, на котором находится каретка (без панелей).
+    _workAreaAt(x, y) {
+        const monitors = Main.layoutManager.monitors;
+        const index = monitors.findIndex(m =>
+            x >= m.x && x < m.x + m.width && y >= m.y && y < m.y + m.height);
+        return Main.layoutManager.getWorkAreaForMonitor(
+            index >= 0 ? index : Main.layoutManager.primaryIndex);
+    }
+
+    // Не hide(): он перекрыл бы Clutter.Actor.hide(), который Shell вызывает
+    // у chrome-актёров внутри себя.
+    dismiss() {
         this.visible = false;
     }
 
     destroy() {
-        this.close(BoxPointer.PopupAnimation.NONE);
         Main.layoutManager.removeChrome(this);
-        this._dummyCursor.destroy();
-        this._dummyCursor = null;
         super.destroy();
     }
 };
@@ -108,26 +177,29 @@ export default class LangIndicatorExtension extends Extension {
         this._inputSourceManager = getInputSourceManager();
         this._ibusManager = getIBusManager();
         this._panelService = null;
-        this._geometry = null;
-        this._source = null;
+        this._caret = null;
+        // Окно, чей input context последним получил фокус IBus (не то же самое,
+        // что окно фокуса экрана): по нему отличаем потерю фокуса полем внутри
+        // окна от запоздавшего focus-out прежнего окна.
+        this._caretWinId = null;
         this._updateId = 0;
-        // Последняя известная каретка по каждому окну: позволяет показать
-        // индикатор сразу при переходе в окно, не дожидаясь нового события.
+        // Последняя известная каретка по каждому окну: `{rect, focused}`.
+        // Позволяет показать индикатор сразу при переходе в окно, не дожидаясь
+        // нового события; `focused` не даёт «оживить» индикатор в окне, где
+        // текстовое поле уже потеряло фокус.
         this._carets = new Map();
-
-        // AT-SPI: штатный трекер Shell (он же сам делает Atspi.init()).
-        this._focusCaretTracker = new FocusCaretTracker();
-        this._focusCaretTracker.connectObject(
-            'caret-moved', (_tracker, event) => this._onAtspiEvent(event, false), this);
-        this._focusCaretTracker.connectObject(
-            'focus-changed', (_tracker, event) => this._onAtspiEvent(event, true), this);
-        this._focusCaretTracker.registerCaretListener();
-        this._focusCaretTracker.registerFocusListener();
 
         // IBus panel service создаётся асинхронно: подписываемся на ready.
         this._ibusManager.connectObject(
             'ready', () => this._syncPanelService(), this);
         this._syncPanelService();
+
+        // Фокус текстового поля (IBus input context): потеря — скрываем сразу,
+        // получение — показываем из кэша, не дожидаясь события о позиции.
+        this._ibusManager.connectObject(
+            'focus-out', () => this._onIbusFocusOut(), this);
+        this._ibusManager.connectObject(
+            'focus-in', () => this._onIbusFocusIn(), this);
 
         // Смена раскладки — обновляем текст индикатора.
         this._inputSourceManager.connectObject(
@@ -143,21 +215,62 @@ export default class LangIndicatorExtension extends Extension {
         const win = global.display.focus_window;
         const cached = win ? this._carets.get(win.get_id()) : null;
 
-        this._geometry = cached?.rect ?? null;
-        this._source = cached?.source ?? null;
-
         // Окно могло сдвинуться, пока было без фокуса — кэш тогда бесполезен.
-        if (this._geometry && !this._isInsideFocusWindow(this._geometry)) {
-            this._geometry = null;
-            this._source = null;
-        }
+        // Запись с потерянным фокусом поля не показываем: переключение окна не
+        // доказывает, что текстовое поле в нём снова активно.
+        this._caret = cached?.focused && this._isInsideFocusWindow(cached.rect)
+            ? cached.rect
+            : null;
+        // `_caretWinId` здесь не трогаем: он принадлежит стороне IBus и меняется
+        // только по её событиям (см. `_onIbusFocusOut`).
 
         // Есть сохранённая позиция каретки этого окна — показываем сразу,
-        // иначе ждём первое событие (AT-SPI/IBus) уже с чистым состоянием.
-        if (this._geometry)
+        // иначе ждём первое событие IBus уже с чистым состоянием.
+        if (this._caret)
             this._scheduleUpdate();
         else
             this._hide();
+    }
+
+    // Текстовое поле потеряло фокус (IBus focus-out): Tab на неактивный
+    // элемент, клик по пустому месту — окно при этом не меняется. Прячем и
+    // помечаем запись кэша, чтобы при возврате в окно не показать индикатор
+    // на устаревшей позиции.
+    _onIbusFocusOut() {
+        const win = global.display.focus_window;
+
+        // Запоздавшее событие прежнего окна (фокус уже перешёл в другое) — это
+        // деактивация окна, а не потеря фокуса полем внутри него: кэш не
+        // трогаем, иначе при возврате не сможем показать индикатор сразу.
+        // Без окна фокуса (обзор, рабочий стол) событие считаем своим.
+        if (this._caretWinId && win && this._caretWinId !== win.get_id())
+            return;
+
+        const entry = this._caretWinId ? this._carets.get(this._caretWinId) : null;
+        if (entry)
+            entry.focused = false;
+
+        this._caret = null;
+        this._hide();
+    }
+
+    // В окне снова есть активное текстовое поле (в том числе после Tab в
+    // другое поле): показываем сразу из кэша окна — точную позицию приложение
+    // пришлёт следующим set-cursor-location. Событие IBus приходит уже после
+    // notify::focus-window, поэтому окно берём из текущего фокуса экрана.
+    _onIbusFocusIn() {
+        const win = global.display.focus_window;
+        if (!win)
+            return;
+
+        const entry = this._carets.get(win.get_id());
+        if (!entry || !this._isInsideFocusWindow(entry.rect))
+            return;
+
+        entry.focused = true;
+        this._caret = entry.rect;
+        this._caretWinId = win.get_id();
+        this._scheduleUpdate();
     }
 
     _syncPanelService() {
@@ -191,21 +304,15 @@ export default class LangIndicatorExtension extends Extension {
         }
     }
 
-    // --- IBus (запасной источник) ---
-
     _setIbusGeometry(x, y, w, h, relative) {
-        // AT-SPI уже ведёт это окно — его позиция текущая, IBus отстаёт.
-        if (this._source === 'atspi')
-            return;
-
-        // IBus может прислать «пустую» позицию 0,0,0,0 до того, как узнает
-        // каретку. Реальный прямоугольник каретки имеет ненулевую высоту
-        // (ширина может быть 0 — это вертикальная черта).
         if (w === 0 && h === 0)
             return;
 
         const rect = this._ibusToStage(x, y, w, h, relative);
-        this._applyGeometry(rect, 'ibus');
+        if (!rect)
+            return;
+
+        this._applyGeometry(rect);
     }
 
     // Перевод координат IBus в stage. Повторяет ui/ibusCandidatePopup.js.
@@ -239,108 +346,9 @@ export default class LangIndicatorExtension extends Extension {
         };
     }
 
-    // --- AT-SPI (основной источник) ---
-
-    _onAtspiEvent(event, isFocus) {
-        if (!this._indicator || !this._inputSourceManager)
-            return;
-
-        try {
-            if (isFocus) {
-                // FocusCaretTracker шлёт все state-changed — нам нужен только
-                // факт получения фокуса.
-                if (event.type !== FOCUS_CHANGED || event.detail1 !== 1)
-                    return;
-            } else if (event.type !== CARET_MOVED) {
-                return;
-            }
-
-            const accessible = event.source;
-            if (!accessible)
-                return;
-
-            if (!this._isFocusWindowPid(accessible))
-                return;
-
-            // Для focus-changed НЕ пытаемся получить позицию каретки — ждём caret-moved.
-            // Это избежит "мигания" (индикатор наверху виджета → у каретки).
-            if (isFocus)
-                return;
-
-            const extents = this._caretExtents(accessible, event);
-            if (extents) {
-                this._applyGeometry(this._atspiToStage(extents), 'atspi');
-                return;
-            }
-
-            // Caret-moved для виджета без каретки — забываем позицию.
-            this._forgetCaret();
-        } catch (e) {
-            // Отдельные события без корректных extents игнорируем.
-        }
-    }
-
-    // Событие должно прийти от процесса окна фокуса: отсекает запоздавшие
-    // события предыдущего окна и фоновых приложений. Заодно отсекает shell:
-    // в его UI global.display.focus_window == null.
-    _isFocusWindowPid(accessible) {
-        const focusWindow = global.display.focus_window;
-        if (!focusWindow)
-            return false;
-
-        const focusPid = focusWindow.get_pid();
-        let sourcePid = -1;
-        try {
-            sourcePid = accessible.get_process_id();
-        } catch (e) {
-            sourcePid = -1;
-        }
-
-        return !(sourcePid > 0 && focusPid > 0 && sourcePid !== focusPid);
-    }
-
-    _caretExtents(accessible, event) {
-        const text = accessible.get_text_iface();
-        if (text) {
-            // У caret-moved новый offset приходит в detail1.
-            const offset = event.detail1;
-            if (offset >= 0) {
-                const extents = text.get_character_extents(
-                    offset, Atspi.CoordType.WINDOW);
-                if (extents && (extents.width > 0 || extents.height > 0))
-                    return extents;
-            }
-        }
-        return null;
-    }
-
-    // extents AT-SPI (в координатах окна) -> stage. Контракт mutter тот же,
-    // что в magnifier.js: origin — get_client_content_rect(), масштаб — Shell.
-    _atspiToStage(extents) {
-        const focusWindow = global.display.focus_window;
-        if (!focusWindow)
-            return null;
-
-        const windowRect = focusWindow.get_client_content_rect();
-        const scaleFactor =
-            St.ThemeContext.get_for_stage(global.stage).scale_factor;
-
-        // get_character_extents возвращает позицию СИМВОЛА, а каретка находится
-        // ПОСЛЕ символа. Используем extents.x + extents.width для позиции каретки.
-        const caretX = extents.x + extents.width;
-        const caretY = extents.y;
-
-        return {
-            x: Math.round(windowRect.x + (scaleFactor * caretX)),
-            y: Math.round(windowRect.y + (scaleFactor * caretY)),
-            width: Math.round(scaleFactor * extents.width),
-            height: Math.round(scaleFactor * extents.height),
-        };
-    }
-
     // --- Общее ---
 
-    _applyGeometry(rect, source) {
+    _applyGeometry(rect) {
         if (!rect)
             return;
 
@@ -349,11 +357,8 @@ export default class LangIndicatorExtension extends Extension {
         if (!this._isInsideFocusWindow(rect))
             return;
 
-        this._geometry = rect;
-        if (this._source !== source)
-            log(`[LangIndicator] источник каретки: ${source}`);
-        this._source = source;
-        this._rememberCaret(rect, source);
+        this._caret = rect;
+        this._rememberCaret(rect);
         this._scheduleUpdate();
     }
 
@@ -369,29 +374,20 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     // Кэш последней каретки по окнам: при возврате в окно индикатор
-    // показывается сразу, не дожидаясь события. Размер ограничен — хранить
+    // показывается сразу, не дожидаясь события. `focused` — было ли поле
+    // в фокусе на момент последнего события. Размер ограничен — хранить
     // историю всех окон незачем.
-    _rememberCaret(rect, source) {
+    _rememberCaret(rect) {
         const win = global.display.focus_window;
         if (!win)
             return;
 
         const id = win.get_id();
+        this._caretWinId = id;
         this._carets.delete(id);
-        this._carets.set(id, {rect, source});
+        this._carets.set(id, {rect, focused: true});
         if (this._carets.size > 16)
             this._carets.delete(this._carets.keys().next().value);
-    }
-
-    // Фокус ушёл на виджет без каретки: забываем позицию текущего окна.
-    _forgetCaret() {
-        const win = global.display.focus_window;
-        if (win)
-            this._carets.delete(win.get_id());
-
-        this._geometry = null;
-        this._source = null;
-        this._hide();
     }
 
     _scheduleUpdate() {
@@ -414,12 +410,12 @@ export default class LangIndicatorExtension extends Extension {
     }
 
     _update() {
-        if (!this._indicator || !this._geometry)
+        if (!this._indicator || !this._caret)
             return;
         const label = this._currentLayoutLabel();
         if (!label)
             return;
-        this._indicator.update(label, this._geometry);
+        this._indicator.update(label, this._caret);
     }
 
     _hide() {
@@ -432,11 +428,6 @@ export default class LangIndicatorExtension extends Extension {
             this._updateId = 0;
         }
 
-        this._focusCaretTracker?.deregisterCaretListener();
-        this._focusCaretTracker?.deregisterFocusListener();
-        this._focusCaretTracker?.disconnectObject(this);
-        this._focusCaretTracker = null;
-
         this._inputSourceManager?.disconnectObject(this);
         this._ibusManager?.disconnectObject(this);
         this._panelService?.disconnectObject(this);
@@ -447,8 +438,8 @@ export default class LangIndicatorExtension extends Extension {
         this._inputSourceManager = null;
         this._ibusManager = null;
         this._panelService = null;
-        this._geometry = null;
-        this._source = null;
+        this._caret = null;
+        this._caretWinId = null;
         this._carets = null;
     }
 }
