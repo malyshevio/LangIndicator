@@ -16,9 +16,13 @@ GNOME Shell-расширение (JavaScript/GJS), которое показыв
 
 ## 1. Требования и ограничения
 
-- **Целевая среда:** Linux + Wayland, GNOME Shell 45+.
+- **Целевая среда:** Linux + Wayland, GNOME Shell 47+ (`protocol_to_stage_rect`).
 - **Позиционирование (критично):** индикатор появляется **строго у каретки**, а не у курсора мыши. Позиция мыши не является допустимым fallback-ом. Там, где точное позиционирование у каретки технически невозможно, это фиксируется как ограничение, а не подменяется позицией мыши.
-- **Триггеры:** 1) переключение раскладки; 2) запуск утилиты (кратковременный показ текущей раскладки).
+- **Поведение:** индикатор постоянно находится у каретки активного окна и
+  следует за ней (печать, стрелки, backspace). При потере фокуса/смене окна
+  скрывается и появляется у каретки нового окна.
+- **Триггеры:** 1) переключение раскладки (обновляет текст); 2) запуск/включение
+  расширения (показывает текущую раскладку у каретки); 3) фокус в текстовом поле.
 - **Стек:** отображение — GNOME Shell Extension (GJS). Rust/Go — только вспомогательные задачи (мониторинг XKB, D-Bus), **не как GUI-слой**.
 - **Терминал:** не требуется.
 
@@ -28,8 +32,8 @@ GNOME Shell-расширение (JavaScript/GJS), которое показыв
 
 Коротко; подробности, сниппеты и источники — в [docs/research.md](docs/research.md).
 
-- **IBus panel service (основной путь):** сигналы `set-cursor-location` / `set-cursor-location-relative` от `getIBusManager()._panelService`. Работает для приложений, сообщающих позицию в input-method (GTK/Qt с IBus-модулем).
-- **AT-SPI (fallback):** события `object:text-caret-moved` + `atspi_text_get_character_extents` (как в GNOME Shell Magnifier). Для приложений с поддержкой accessibility.
+- **IBus panel service (запасной путь):** сигналы `set-cursor-location` / `set-cursor-location-relative` от `getIBusManager()._panelService`. Работает для приложений, сообщающих позицию в input-method (GTK/Qt с IBus-модулем). Особенности: позиция не приходит при простом фокусе и может отставать на один отчёт — поэтому IBus используется как запасной источник.
+- **AT-SPI (основной источник позиции):** события `object:text-caret-moved` и `object:state-changed:focused` через штатный `FocusCaretTracker` Shell + `atspi_text_get_character_extents` (как в GNOME Shell Magnifier). Даёт текущую позицию и работает на стрелках/backspace, если приложение отдаёт a11y-каретку.
 - **Смена раскладки:** `getInputSourceManager()`, сигнал `current-source-changed`.
 - **Оверлей:** `BoxPointer.BoxPointer` + dummy-актор + `Main.layoutManager.addTopChrome(...)`, чтобы не перехватывать фокус ввода.
 

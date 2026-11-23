@@ -1,12 +1,21 @@
 // Lang Indicator — индикатор раскладки у курсора ввода (GNOME Shell, Wayland).
 //
-// Позиционирование: IBus (set-cursor-location*) даёт точные stage-координаты, но
-// приходит только при движении/вводе. AT-SPI дополняет — показывает позицию при
-// фокусе и на стрелках (IBus там молчит). Приоритета нет: последнее событие
-// (IBus или AT-SPI) побеждает.
+// Модель позиционирования — одна и детерминированная (никаких «кто победил»):
+//   • AT-SPI — основной источник: события caret-moved/focused дают ТЕКУЩУЮ
+//     позицию каретки; работают при фокусе, на стрелках и backspace;
+//   • IBus (set-cursor-location*) — запасной источник для приложений без a11y.
+//     IBus не присылает позицию при простом фокусе и отстаёт на один отчёт,
+//     поэтому как только AT-SPI дал позицию для текущего окна, IBus для этого
+//     окна игнорируется — иначе индикатор прыгает между двумя источниками;
+//   • при смене окна/потере фокуса индикатор скрывается и ждёт позицию нового
+//     окна (не висит на каретке прошлого окна); последняя позиция каретки
+//     запоминается по окнам, чтобы при возврате показать сразу;
+//   • текст («RU»/«EN») обновляется при смене раскладки.
 //
-// Поведение: индикатор следует за кареткой, не исчезает; скрывается при потере
-// фокуса; при смене окна ждёт позицию новой каретки (не висит на прошлой).
+// AT-SPI слушаем через штатный FocusCaretTracker (тот же, что в magnifier.js),
+// а не собственным листенером — меньше шансов уронить сессию.
+//
+// Подробности — docs/research.md, план — в YouGile.
 
 import Atspi from 'gi://Atspi';
 import Clutter from 'gi://Clutter';
@@ -18,12 +27,27 @@ import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {getIBusManager} from 'resource:///org/gnome/shell/misc/ibusManager.js';
 import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
+import {FocusCaretTracker} from 'resource:///org/gnome/shell/ui/focusCaretTracker.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 
 const CARET_MOVED = 'object:text-caret-moved';
-const ENABLE_ATSPI_FALLBACK = true;
-const DEBUG = true;
+const FOCUS_CHANGED = 'object:state-changed:focused';
+// Склейка частых событий AT-SPI/IBus в один relayout (~60 Гц).
+const UPDATE_DELAY_MS = 16;
+// Допуск при проверке «каретка внутри окна фокуса»: отсекает запоздалые
+// события предыдущего окна, но не спотыкается на тени/декорациях и на
+// расхождении origin у разных приложений.
+const BOUNDS_MARGIN = 128;
+// Роли, у которых есть каретка: для них при фокусе допустимо позиционироваться
+// по extents самого виджета (если приложение не отдаёт offset каретки).
+const TEXT_ROLES = new Set([
+    Atspi.Role.TEXT,
+    Atspi.Role.ENTRY,
+    Atspi.Role.PARAGRAPH,
+    Atspi.Role.DOCUMENT_TEXT,
+    Atspi.Role.TERMINAL,
+]);
 
 const Indicator = class Indicator extends BoxPointer.BoxPointer {
     static {
@@ -32,9 +56,11 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
 
     constructor() {
         super(St.Side.TOP);
+        this._isOpen = false;
         this.visible = false;
         this.add_style_class_name('lang-indicator-boxpointer');
 
+        // «Dummy»-актор задаёт точку привязки BoxPointer к каретке.
         this._dummyCursor = new Clutter.Actor({opacity: 0});
         Main.layoutManager.uiGroup.add_child(this._dummyCursor);
         Main.layoutManager.addTopChrome(this);
@@ -45,7 +71,8 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
         box.add_child(this._label);
     }
 
-    // Названо не show(), чтобы не перекрыть Clutter.Actor.show().
+    // Названо не show(), чтобы не перекрыть Clutter.Actor.show(), который
+    // BoxPointer.open() вызывает внутри себя.
     update(text, rect) {
         this._label.text = text;
         this._dummyCursor.set_position(rect.x, rect.y);
@@ -54,8 +81,23 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
             rect.height > 0 ? rect.height : 1);
         this.setPosition(this._dummyCursor, 0);
 
-        if (!this.visible)
-            this.open(BoxPointer.PopupAnimation.NONE);
+        if (this._isOpen)
+            return;
+
+        this._isOpen = true;
+        this.open(BoxPointer.PopupAnimation.NONE);
+    }
+
+    // Не hide(): он перекрыл бы Clutter.Actor.hide(), который BoxPointer.close()
+    // вызывает внутри себя.
+    dismiss() {
+        if (!this._isOpen)
+            return;
+
+        this._isOpen = false;
+        // Прячем актёра напрямую: close() запускает анимацию и может скрыть
+        // заново уже переоткрытый индикатор (гонка при смене окна).
+        this.visible = false;
     }
 
     destroy() {
@@ -69,34 +111,61 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
 
 export default class LangIndicatorExtension extends Extension {
     enable() {
-        const version = this.metadata?.['version-name'] ?? 'unknown';
-        log(`[LangIndicator] v${version} enable`);
+        log(`[LangIndicator] v${this.metadata?.['version-name'] ?? '?'} enable`);
         this._indicator = new Indicator();
         this._inputSourceManager = getInputSourceManager();
         this._ibusManager = getIBusManager();
         this._panelService = null;
-
         this._geometry = null;
-        this._visible = false;
-        this._updateScheduled = false;
-        this._updateTimeoutId = 0;
-        this._windowActor = null;
-        this._actorX = 0;
-        this._actorY = 0;
+        this._source = null;
+        this._updateId = 0;
+        // Последняя известная каретка по каждому окну: позволяет показать
+        // индикатор сразу при переходе в окно, не дожидаясь нового события.
+        this._carets = new Map();
 
+        // AT-SPI: штатный трекер Shell (он же сам делает Atspi.init()).
+        this._focusCaretTracker = new FocusCaretTracker();
+        this._focusCaretTracker.connectObject(
+            'caret-moved', (_tracker, event) => this._onAtspiEvent(event, false), this);
+        this._focusCaretTracker.connectObject(
+            'focus-changed', (_tracker, event) => this._onAtspiEvent(event, true), this);
+        this._focusCaretTracker.registerCaretListener();
+        this._focusCaretTracker.registerFocusListener();
+
+        // IBus panel service создаётся асинхронно: подписываемся на ready.
         this._ibusManager.connectObject(
             'ready', () => this._syncPanelService(), this);
         this._syncPanelService();
 
-        if (ENABLE_ATSPI_FALLBACK)
-            this._initAtspiFallback();
-
+        // Смена раскладки — обновляем текст индикатора.
         this._inputSourceManager.connectObject(
-            'current-source-changed', () => this._updateIndicator(), this);
+            'current-source-changed', () => this._update(), this);
 
+        // Смена окна/потеря фокуса — скрываем и ждём позицию нового окна.
         global.display.connectObject(
             'notify::focus-window', () => this._onFocusWindowChanged(), this);
         this._onFocusWindowChanged();
+    }
+
+    _onFocusWindowChanged() {
+        const win = global.display.focus_window;
+        const cached = win ? this._carets.get(win.get_id()) : null;
+
+        this._geometry = cached?.rect ?? null;
+        this._source = cached?.source ?? null;
+
+        // Окно могло сдвинуться, пока было без фокуса — кэш тогда бесполезен.
+        if (this._geometry && !this._isInsideFocusWindow(this._geometry)) {
+            this._geometry = null;
+            this._source = null;
+        }
+
+        // Есть сохранённая позиция каретки этого окна — показываем сразу,
+        // иначе ждём первое событие (AT-SPI/IBus) уже с чистым состоянием.
+        if (this._geometry)
+            this._scheduleUpdate();
+        else
+            this._hide();
     }
 
     _syncPanelService() {
@@ -106,143 +175,61 @@ export default class LangIndicatorExtension extends Extension {
         }
 
         const service = this._ibusManager._panelService;
-        if (!this._ibusManager._ready || !service) {
-            if (DEBUG)
-                log(`[LangIndicator] ibus panel service не готов (ready=${this._ibusManager._ready}, service=${!!service})`);
+        if (!this._ibusManager._ready || !service)
             return;
-        }
 
         this._panelService = service;
-        if (DEBUG)
-            log('[LangIndicator] ibus panel service подключён');
 
-        this._panelService.connectObject(
-            'set-cursor-location', (_svc, x, y, w, h) => {
-                this._setGeometry(x, y, w, h, false);
-            }, this);
+        try {
+            this._panelService.connectObject(
+                'set-cursor-location', (_svc, x, y, w, h) => {
+                    this._setIbusGeometry(x, y, w, h, false);
+                }, this);
+        } catch (e) {
+            log(`[LangIndicator] set-cursor-location недоступен: ${e.message}`);
+        }
 
         try {
             this._panelService.connectObject(
                 'set-cursor-location-relative', (_svc, x, y, w, h) => {
-                    this._setGeometry(x, y, w, h, true);
+                    this._setIbusGeometry(x, y, w, h, true);
                 }, this);
         } catch (e) {
             // Only recent IBus versions have support for this signal.
         }
-
-        this._panelService.connectObject(
-            'focus-out', () => this._hideIndicator('focus-out'), this);
     }
 
-    _onFocusWindowChanged() {
-        if (this._windowActor) {
-            this._windowActor.disconnectObject(this);
-            this._windowActor = null;
-        }
+    // --- IBus (запасной источник) ---
 
-        const win = global.display.focus_window;
-        const actor = win?.get_compositor_private();
-        if (DEBUG)
-            log(`[LangIndicator] focus window=${win ? win.get_id() : 'null'} actor=${actor ? `${actor.x},${actor.y}` : 'null'}`);
-        if (actor) {
-            this._windowActor = actor;
-            this._actorX = actor.x;
-            this._actorY = actor.y;
-            actor.connectObject(
-                'notify::x', () => this._followWindow(),
-                'notify::y', () => this._followWindow(),
-                this);
-        }
-
-        // Смена окна: сбрасываем геометрию, чтобы не показать на прошлом месте.
-        this._geometry = null;
-        this._hideIndicator('focus-window-changed');
-    }
-
-    // Каретка на экране смещается вместе с окном — сдвигаем позицию.
-    _followWindow() {
-        if (!this._windowActor)
+    _setIbusGeometry(x, y, w, h, relative) {
+        // AT-SPI уже ведёт это окно — его позиция текущая, IBus отстаёт.
+        if (this._source === 'atspi')
             return;
 
-        const dx = this._windowActor.x - this._actorX;
-        const dy = this._windowActor.y - this._actorY;
-        if (dx === 0 && dy === 0)
-            return;
-        if (DEBUG)
-            log(`[LangIndicator] window moved dx=${dx} dy=${dy}`);
-
-        // Базу обновляем ВСЕГДА, даже без геометрии каретки: иначе при
-        // следующем движении применим накопленную дельту повторно.
-        this._actorX = this._windowActor.x;
-        this._actorY = this._windowActor.y;
-
-        if (!this._geometry)
-            return;
-
-        this._geometry.x += dx;
-        this._geometry.y += dy;
-
-        if (this._visible)
-            this._scheduleUpdate();
-    }
-
-    _setGeometry(x, y, w, h, relative) {
+        // IBus может прислать «пустую» позицию 0,0,0,0 до того, как узнает
+        // каретку. Реальный прямоугольник каретки имеет ненулевую высоту
+        // (ширина может быть 0 — это вертикальная черта).
         if (w === 0 && h === 0)
             return;
 
-        const rect = this._toStage(x, y, w, h, relative);
-        if (!rect)
-            return;
-
-        const focusWindow = global.display.focus_window;
-        if (!focusWindow) {
-            if (DEBUG)
-                log('[LangIndicator] caret: нет окна фокуса, skip');
-            return;
-        }
-
-        // Санити-чек: каретка должна быть в пределах окна фокуса. Опираемся на
-        // rect window actor (на него же опирается конвертация); отсекает
-        // «запоздалые» события от предыдущего окна.
-        const winActor = focusWindow.get_compositor_private();
-        const fr = focusWindow.get_frame_rect();
-        const bx = winActor ? winActor.x : fr.x;
-        const by = winActor ? winActor.y : fr.y;
-        const bw = winActor ? winActor.width : fr.width;
-        const bh = winActor ? winActor.height : fr.height;
-        if (rect.x < bx - 16 || rect.x > bx + bw + 16 ||
-            rect.y < by - 16 || rect.y > by + bh + 16) {
-            if (DEBUG)
-                log(`[LangIndicator] caret ${rect.x},${rect.y} вне окна ${bx},${by} ${bw}x${bh}, skip`);
-            return;
-        }
-
-        this._geometry = rect;
-        this._visible = true;
-        if (DEBUG)
-            log(`[LangIndicator] caret ${relative ? 'rel' : 'abs'} raw=${x},${y} -> ${rect.x},${rect.y}`);
-        this._scheduleUpdate();
+        const rect = this._ibusToStage(x, y, w, h, relative);
+        this._applyGeometry(rect, 'ibus');
     }
 
     // Перевод координат IBus в stage. Повторяет ui/ibusCandidatePopup.js.
-    _toStage(x, y, w, h, relative) {
+    _ibusToStage(x, y, w, h, relative) {
         const focusWindow = global.display.focus_window;
-        if (!focusWindow) {
-            if (DEBUG)
-                log('[LangIndicator] _toStage: нет окна фокуса');
+        if (!focusWindow)
             return null;
-        }
 
         let rect = new Mtk.Rectangle({x, y, width: w, height: h});
 
         if (relative) {
             rect = focusWindow.protocol_to_stage_rect(rect);
             const windowActor = focusWindow.get_compositor_private();
-            if (!windowActor) {
-                if (DEBUG)
-                    log('[LangIndicator] _toStage: нет window actor (relative)');
+            if (!windowActor)
                 return null;
-            }
+            // IBus GtkIMModule не знает о масштабе Shell.
             const scale = windowActor.get_resource_scale();
             rect.x = windowActor.x + (rect.x / scale);
             rect.y = windowActor.y + (rect.y / scale);
@@ -260,243 +247,226 @@ export default class LangIndicatorExtension extends Extension {
         };
     }
 
-    // --- AT-SPI fallback (включён под флагом ENABLE_ATSPI_FALLBACK) ---
-    _initAtspiFallback() {
-        this._atspiListener = null;
-        try {
-            const initRet = Atspi.init();
-            if (initRet !== 0 && initRet !== 1) {
-                log(`[LangIndicator] AT-SPI недоступен (init=${initRet})`);
-                return;
-            }
-            Atspi.set_timeout(250, 250);
-            this._atspiListener =
-                Atspi.EventListener.new(this._onAtspiCaretMoved.bind(this));
-            this._atspiListener.register(CARET_MOVED);
-            this._atspiListener.register('object:state-changed:focused');
-            log('[LangIndicator] AT-SPI listener registered');
-        } catch (e) {
-            log(`[LangIndicator] AT-SPI fallback выключен: ${e.message}`);
-            this._atspiListener = null;
-        }
-    }
+    // --- AT-SPI (основной источник) ---
 
-    _onAtspiCaretMoved(event) {
+    _onAtspiEvent(event, isFocus) {
         if (!this._indicator || !this._inputSourceManager)
             return;
+
         try {
-            const type = event?.type ?? '';
-            const isCaret = type === 'object:text-caret-moved';
-            const isFocus = type === 'object:state-changed:focused' &&
-                event.detail1 === 1;
-            if (!isCaret && !isFocus)
+            if (isFocus) {
+                // FocusCaretTracker шлёт все state-changed — нам нужен только
+                // факт получения фокуса.
+                if (event.type !== FOCUS_CHANGED || event.detail1 !== 1)
+                    return;
+            } else if (event.type !== CARET_MOVED) {
                 return;
+            }
 
             const accessible = event.source;
-            const text = accessible?.get_text_iface();
-            if (!text) {
-                if (DEBUG)
-                    log('[LangIndicator] atspi: нет text iface, skip');
+            if (!accessible)
+                return;
+
+            if (!this._isFocusWindowPid(accessible))
+                return;
+
+            const extents = this._caretExtents(accessible, event, isFocus);
+            if (extents) {
+                this._applyGeometry(this._atspiToStage(extents), 'atspi');
                 return;
             }
-            // Для caret-moved берём offset из события (detail1) — запрос
-            // get_caret_offset() может вернуть устаревший (на шаг позади).
-            const caretOffset = isCaret ? event.detail1 : text.get_caret_offset();
-            if (caretOffset < 0) {
-                if (DEBUG)
-                    log('[LangIndicator] atspi: caret offset < 0, skip');
-                return;
-            }
-            const extents = text.get_character_extents(
-                caretOffset, Atspi.CoordType.WINDOW);
-            if (!extents || (extents.width === 0 && extents.height === 0)) {
-                if (DEBUG)
-                    log('[LangIndicator] atspi: пустые extents, skip');
-                return;
-            }
-            const rect = this._convertExtentsToScreenSpace(accessible, extents, isFocus);
-            if (!rect)
-                return;
-            this._geometry = rect;
-            this._visible = true;
-            if (DEBUG)
-                log(`[LangIndicator] atspi ${isFocus ? 'focus' : 'caret'} -> ${rect.x},${rect.y}`);
-            this._scheduleUpdate();
+
+            // Фокус ушёл на виджет без каретки (кнопка, картинка) — держать
+            // старую позицию в этом окне смысла нет.
+            if (isFocus)
+                this._forgetCaret();
         } catch (e) {
-            if (DEBUG)
-                log(`[LangIndicator] atspi error: ${e.message}`);
+            // Отдельные события без корректных extents игнорируем.
         }
     }
 
-    _convertExtentsToScreenSpace(accessible, extents, isFocus) {
-        const toplevelWindowTypes = new Set(
-            [Atspi.Role.FRAME, Atspi.Role.DIALOG, Atspi.Role.WINDOW]);
+    // Событие должно прийти от процесса окна фокуса: отсекает запоздавшие
+    // события предыдущего окна и фоновых приложений. Заодно отсекает shell:
+    // в его UI global.display.focus_window == null.
+    _isFocusWindowPid(accessible) {
+        const focusWindow = global.display.focus_window;
+        if (!focusWindow)
+            return false;
 
+        const focusPid = focusWindow.get_pid();
+        let sourcePid = -1;
         try {
-            let app = null;
-            let parentWindow = null;
-            let iter = accessible;
-            while (iter) {
-                if (iter.get_role() === Atspi.Role.APPLICATION) {
-                    app = iter;
-                    break;
-                } else if (toplevelWindowTypes.has(iter.get_role())) {
-                    parentWindow = iter;
-                }
-                iter = iter.get_parent();
-            }
-
-            if (app && app.get_name() === 'gnome-shell') {
-                // Свои (shell) extents уже в stage-координатах — возвращаем как есть,
-                // чтобы индикатор работал в поиске приложений и диалогах GNOME.
-                return {
-                    x: extents.x,
-                    y: extents.y,
-                    width: extents.width,
-                    height: extents.height,
-                };
-            }
-
-            // PID — статичная идентичность, не «отстаёт»; проверяем всегда,
-            // чтобы отсечь запоздалые focus-события от другого приложения.
-            const focusWindow = global.display.focus_window;
-            if (focusWindow) {
-                const focusPid = focusWindow.get_pid();
-                if (focusPid > 0 && app) {
-                    let appPid = -1;
-                    try {
-                        appPid = app.get_process_id();
-                    } catch (e2) {
-                        appPid = -1;
-                    }
-                    if (appPid > 0 && appPid !== focusPid) {
-                        if (DEBUG)
-                            log(`[LangIndicator] atspi: pid не совпал (app=${appPid}, focus=${focusPid}), skip`);
-                        return null;
-                    }
-                }
-            }
-
-            // ACTIVE/FOCUSED в a11y-кеше отстают от реального фокуса — для
-            // focus-события доверяем самому событию; для caret-moved — строго.
-            if (!isFocus) {
-                const windowActive = parentWindow &&
-                    parentWindow.get_state_set().contains(Atspi.StateType.ACTIVE);
-                const accessibleFocused =
-                    accessible.get_state_set().contains(Atspi.StateType.FOCUSED);
-                if (!windowActive || !accessibleFocused) {
-                    if (DEBUG)
-                        log(`[LangIndicator] atspi: не в фокусе (windowActive=${!!windowActive}, accessibleFocused=${!!accessibleFocused}), skip`);
-                    return null;
-                }
-            }
+            sourcePid = accessible.get_process_id();
         } catch (e) {
-            if (DEBUG)
-                log(`[LangIndicator] atspi: convert error ${e.message}`);
-            return null;
+            sourcePid = -1;
         }
 
+        return !(sourcePid > 0 && focusPid > 0 && sourcePid !== focusPid);
+    }
+
+    _caretExtents(accessible, event, isFocus) {
+        const text = accessible.get_text_iface();
+        if (text) {
+            // У caret-moved новый offset приходит в detail1; запрос
+            // get_caret_offset() может отдать устаревшее значение.
+            let offset = isFocus ? -1 : event.detail1;
+            if (!(offset >= 0))
+                offset = text.get_caret_offset();
+            if (offset >= 0) {
+                const extents = text.get_character_extents(
+                    offset, Atspi.CoordType.WINDOW);
+                if (extents && (extents.width > 0 || extents.height > 0))
+                    return extents;
+            }
+        }
+
+        // Фокус на текстовом виджете без offset каретки (например, пустое
+        // поле): позиционируемся по extents самого виджета. Для кнопок и
+        // прочих нетекстовых ролей этого не делаем — каретки там нет.
+        if (isFocus && TEXT_ROLES.has(accessible.get_role())) {
+            const component = accessible.get_component_iface();
+            if (component) {
+                const extents = component.get_extents(Atspi.CoordType.WINDOW);
+                if (extents && (extents.width > 0 || extents.height > 0))
+                    return extents;
+            }
+        }
+
+        return null;
+    }
+
+    // extents AT-SPI (в координатах окна) -> stage. Контракт mutter тот же,
+    // что в magnifier.js: origin — get_client_content_rect(), масштаб — Shell.
+    _atspiToStage(extents) {
         const focusWindow = global.display.focus_window;
         if (!focusWindow)
             return null;
 
-        // По контракту mutter AT-SPI window-координаты отсчитываются от
-        // get_client_content_rect() (см. meta_window_get_client_content_rect и
-        // magnifier.js). Берём этот origin.
         const windowRect = focusWindow.get_client_content_rect();
         const scaleFactor =
             St.ThemeContext.get_for_stage(global.stage).scale_factor;
-        const x = windowRect.x + (scaleFactor * extents.x);
-        const y = windowRect.y + (scaleFactor * extents.y);
-
-        if (x < windowRect.x - 16 || x > windowRect.x + windowRect.width + 16 ||
-            y < windowRect.y - 16 || y > windowRect.y + windowRect.height + 16) {
-            if (DEBUG)
-                log(`[LangIndicator] atspi: ${x},${y} вне окна ${windowRect.x},${windowRect.y} ${windowRect.width}x${windowRect.height}, skip`);
-            return null;
-        }
 
         return {
-            x,
-            y,
-            width: scaleFactor * extents.width,
-            height: scaleFactor * extents.height,
+            x: Math.round(windowRect.x + (scaleFactor * extents.x)),
+            y: Math.round(windowRect.y + (scaleFactor * extents.y)),
+            width: Math.round(scaleFactor * extents.width),
+            height: Math.round(scaleFactor * extents.height),
         };
     }
 
+    // --- Общее ---
+
+    _applyGeometry(rect, source) {
+        if (!rect)
+            return;
+
+        // Отсекаем позиции вне окна фокуса (запоздалые события, чужие окна,
+        // битые extents). Позиция мыши не подставляется ни при каких условиях.
+        if (!this._isInsideFocusWindow(rect)) {
+            log(`[LangIndicator] ${source}: ${rect.x},${rect.y} вне окна, skip`);
+            return;
+        }
+
+        this._geometry = rect;
+        if (this._source !== source)
+            log(`[LangIndicator] источник каретки: ${source}`);
+        this._source = source;
+        this._rememberCaret(rect, source);
+        this._scheduleUpdate();
+    }
+
+    _isInsideFocusWindow(rect) {
+        const frame = global.display.focus_window?.get_frame_rect();
+        if (!frame)
+            return false;
+
+        return rect.x >= frame.x - BOUNDS_MARGIN &&
+            rect.x <= frame.x + frame.width + BOUNDS_MARGIN &&
+            rect.y >= frame.y - BOUNDS_MARGIN &&
+            rect.y <= frame.y + frame.height + BOUNDS_MARGIN;
+    }
+
+    // Кэш последней каретки по окнам: при возврате в окно индикатор
+    // показывается сразу, не дожидаясь события. Размер ограничен — хранить
+    // историю всех окон незачем.
+    _rememberCaret(rect, source) {
+        const win = global.display.focus_window;
+        if (!win)
+            return;
+
+        const id = win.get_id();
+        this._carets.delete(id);
+        this._carets.set(id, {rect, source});
+        if (this._carets.size > 16)
+            this._carets.delete(this._carets.keys().next().value);
+    }
+
+    // Фокус ушёл на виджет без каретки: забываем позицию текущего окна.
+    _forgetCaret() {
+        const win = global.display.focus_window;
+        if (win)
+            this._carets.delete(win.get_id());
+
+        this._geometry = null;
+        this._source = null;
+        this._hide();
+    }
+
+    _scheduleUpdate() {
+        if (this._updateId)
+            return;
+
+        this._updateId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, UPDATE_DELAY_MS, () => {
+                this._updateId = 0;
+                this._update();
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
     _currentLayoutLabel() {
-        const src = this._inputSourceManager.currentSource;
+        const src = this._inputSourceManager?.currentSource;
         if (!src)
             return '';
         return (src.shortName || '?').toUpperCase();
     }
 
-    _scheduleUpdate() {
-        if (this._updateScheduled)
-            return;
-        this._updateScheduled = true;
-        this._updateTimeoutId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT, 16, () => {
-                this._updateScheduled = false;
-                this._updateTimeoutId = 0;
-                this._updateIndicator();
-                return GLib.SOURCE_REMOVE;
-            });
-    }
-
-    _updateIndicator() {
-        if (!this._indicator || !this._inputSourceManager)
-            return;
-        if (!this._geometry || !this._visible)
+    _update() {
+        if (!this._indicator || !this._geometry)
             return;
         const label = this._currentLayoutLabel();
-        if (!label) {
-            if (DEBUG)
-                log('[LangIndicator] update: пустой label, skip');
+        if (!label)
             return;
-        }
         this._indicator.update(label, this._geometry);
     }
 
-    _hideIndicator(reason = '') {
-        this._visible = false;
-        if (this._indicator)
-            this._indicator.close(BoxPointer.PopupAnimation.NONE);
-        if (DEBUG)
-            log(`[LangIndicator] hide${reason ? ` (${reason})` : ''}`);
+    _hide() {
+        this._indicator?.dismiss();
     }
 
     disable() {
-        log('[LangIndicator] disable');
+        if (this._updateId) {
+            GLib.source_remove(this._updateId);
+            this._updateId = 0;
+        }
+
+        this._focusCaretTracker?.deregisterCaretListener();
+        this._focusCaretTracker?.deregisterFocusListener();
+        this._focusCaretTracker?.disconnectObject(this);
+        this._focusCaretTracker = null;
+
         this._inputSourceManager?.disconnectObject(this);
         this._ibusManager?.disconnectObject(this);
         this._panelService?.disconnectObject(this);
         global.display?.disconnectObject(this);
-        this._windowActor?.disconnectObject(this);
-        this._windowActor = null;
-
-        if (this._atspiListener) {
-            try {
-                this._atspiListener.deregister(CARET_MOVED);
-                this._atspiListener.deregister('object:state-changed:focused');
-            } catch (e) {
-                // ignore
-            }
-            this._atspiListener = null;
-        }
 
         this._indicator?.destroy();
         this._indicator = null;
         this._inputSourceManager = null;
         this._ibusManager = null;
         this._panelService = null;
-        if (this._updateTimeoutId) {
-            GLib.source_remove(this._updateTimeoutId);
-            this._updateTimeoutId = 0;
-        }
-
         this._geometry = null;
-        this._visible = false;
-        this._updateScheduled = false;
+        this._source = null;
+        this._carets = null;
     }
 }
