@@ -1,104 +1,79 @@
 # AGENTS.md
 
-GNOME Shell extension (JavaScript/GJS) that shows the current keyboard layout
-(`RU`/`EN`) as a popup near the **text caret**. Wayland-only, GNOME Shell 45+.
+GNOME Shell extension (GJS/ESM) that shows the current keyboard layout
+(`RU`/`EN`) as a popup near the **text caret**. Wayland-only, GNOME Shell 47+.
 
 ## Core constraint (don't fight it)
-The GUI **must** be a GNOME Shell extension, not a standalone Rust/Go app: a
-normal Wayland client cannot read another app's caret position (compositor
-isolation). Rust/Go is only for the optional D-Bus XKB helper (`dbus/`, planned
-but not started). See `docs/research.md` for the reasoning and API sources.
+The GUI **must** be a GNOME Shell extension, not a standalone app: a normal
+Wayland client cannot read another app's caret position (compositor isolation).
+`dbus/` is a placeholder for an optional Rust/Go D-Bus XKB helper (not started).
+See `docs/research.md` for reasoning and API sources.
+
+## Architecture (current model)
+- **AT-SPI primary** via Shell's `FocusCaretTracker` (`ui/focusCaretTracker.js`,
+  the same module `magnifier.js` uses). Gives current caret position on
+  focus/arrows/backspace.
+- **IBus fallback** (`set-cursor-location*` on `getIBusManager()._panelService`).
+  Only used while AT-SPI hasn't positioned the current window; ignored
+  afterward (IBus lags one report and misses focus-only events).
+- **Single source per window** — no priority flip-flop, no jitter.
+- **Hide on focus loss / window change.** Per-window caret cache lets the
+  indicator reappear instantly on return.
+- Coordinate conversion: AT-SPI `get_character_extents(WINDOW)` +
+  `focusWindow.get_client_content_rect()` + `scaleFactor` — mirrors `magnifier.js`.
 
 ## No build system
-There is **no** package.json, Makefile, test runner, linter, or CI. The
-extension is plain ESM JS loaded by GNOME Shell. Don't reach for `npm`/`make`/
-`test`; the only local check is a syntax check (see below).
+No package.json, Makefile, test runner, linter, or CI. The extension is plain
+ESM JS loaded by GNOME Shell. Don't reach for `npm`/`make`/`test`.
 
 ## Files that matter
-- `readme.md` — note the **lowercase** name; architecture, constraints, acceptance criteria.
-- `docs/research.md` — how caret position is obtained (IBus + AT-SPI), with snippets and upstream sources (Better IBus, kimpanel, magnifier).
+- `readme.md` (lowercase) — constraints, acceptance criteria.
+- `docs/research.md` — how caret position is obtained, upstream sources.
 - `extension/extension.js` — the entire implementation, single file.
 - `extension/metadata.json` — `uuid` and `shell-version` gate loading.
 - `scripts/install.sh` — dev install via symlink.
-- `dbus/` — placeholder for the optional D-Bus coordinator (Rust/zbus).
 
-## Key constraints / gotchas
-- **ESM only.** GNOME Shell 45+ dropped `imports.*`. Entry point is
-  `export default class … extends Extension` from
-  `resource:///org/gnome/shell/extensions/extension.js`. No `init()`/`enable()` globals.
-- **UUID `lang-indicator@malyshevio.github.io`** is hardcoded in both
-  `metadata.json` and `scripts/install.sh`; they must stay in sync or install breaks.
-- The code uses **private GNOME Shell APIs intentionally** — there is no public
-  API for caret position. Key ones: `getIBusManager()._panelService`,
-  `getInputSourceManager()`, `Main.panel.statusArea.keyboard._indicatorLabels`.
-  Follow the Better IBus / magnifier patterns rather than "cleaning up" to public APIs.
-- Caret position: primary = IBus `set-cursor-location` / `set-cursor-location-relative`
-  signals; fallback = AT-SPI `object:text-caret-moved` (coordinate conversion mirrors `magnifier.js`).
-- `shell-version` in `metadata.json` gates loading. When targeting a new GNOME
-  release, add its version or the extension won't enable.
+## Key gotchas
+- **ESM only.** GNOME Shell 45+ dropped `imports.*`. Entry: `export default
+  class … extends Extension`. No `init()`/`enable()` globals.
+- **UUID `lang-indicator@malyshevio.github.io`** is in both `metadata.json`
+  and `scripts/install.sh`; they must stay in sync or install breaks.
+- **`shell-version`** gates loading. When targeting a new GNOME release, add
+  its version to `metadata.json` or the extension won't enable.
+- Uses **private GNOME Shell APIs** (no public API for caret position):
+  `FocusCaretTracker`, `getIBusManager()._panelService`,
+  `getInputSourceManager()`, `Main.layoutManager.addTopChrome`. Follow
+  `magnifier.js` / `ibusCandidatePopup.js` patterns rather than "cleaning up".
+- `BoxPointer.close()` triggers an animation that can hide a re-opened popup
+  — use `visible = false` directly (the method is `dismiss()`, not `hide()`).
 
 ## Dev loop (requires a real GNOME Shell Wayland session)
 ```bash
-./scripts/install.sh                          # symlink into ~/.local/share/gnome-shell/extensions/
+./scripts/install.sh                          # symlink into extensions dir
 gnome-extensions enable lang-indicator@malyshevio.github.io
-# Wayland: relogin (Alt+F2 → 'r' does NOT work on Wayland)
+# Wayland: relogin — Alt+F2 'r' does NOT work
 journalctl -f -o cat | grep LangIndicator     # extension logs
 ```
 
-This code **cannot be run in a container/CI** (no GNOME Shell). Only a syntax
-check works locally — `node --check` parses `.js` as CommonJS, so check as ESM:
+This code **cannot run in a container/CI**. The only local check — syntax
+(`node --check` parses as CJS, so check as ESM):
 ```bash
 cp extension/extension.js /tmp/extension.mjs && node --check /tmp/extension.mjs
 ```
 
-## Development workflow (mandatory)
-Before delivering any code change, decide whether subagents are needed and
-what to focus on. **Do not run a blanket review every time.**
-
-### Step 1 — Classify the change
-Look at `git diff` (or the edits just made) and categorise:
-
-| Change type | Subagents to run |
-|---|---|
-| Trivial (typos, comments, `metadata.json` version bump, readme rewording) | **None.** Run only the `node --check` syntax check if a `.js` file changed. |
-| Refactor / rename / move code (no behaviour change) | **Tester only** — verify nothing broke. Skip codereviewer. |
-| Behaviour change, new API usage, new signal handler, lifecycle change | **Both** — codereviewer + tester. |
-
-### Step 2 — Write a focused brief (≤ 3 bullets)
-Before spawning codereviewer, write a short brief derived from the diff.
-The brief tells the reviewer **what to look at this time only.** Examples:
-
-- "New `set-cursor-location-relative` handler — check coordinate conversion and null-guard on missing `rect`."
-- "Moved popup creation out of `_onCursorMoved` — check no duplicate St.Widget leaks."
-- "Changed signal disconnect in `disable()` — check no dangling listeners."
-
-Do **not** say "review for correctness, API usage, crash risk" — that is the
-standing rule and causes repetitive findings.
-
-### Step 3 — Run subagents on model `opencode-go/mimo-v2.6-flash`
-Pass the brief as part of the prompt. Each subagent must stay within its
-scope and not re-check areas unchanged since the last review.
-
-- **codereviewer** — agent `coder`: check ONLY the areas listed in the brief.
-  If the brief is empty or trivial, skip this subagent entirely.
-- **tester** — agent `general`: verification ONLY (not code review).
-  1. **First write a short test plan** (3–5 bullet hypotheses) targeting the
-     changed behaviour.
-  2. Keep the hypothesis count small and stop once the plan is covered.
-  3. Run the ESM `node --check` syntax check and verify `metadata.json`
-     `uuid` / `shell-version` against `scripts/install.sh`.
-  4. Report pass/fail per hypothesis. Do **not** re-review code or list
-     style/code-quality issues — that is the codereviewer's job.
-
-Fix findings before finishing. If a finding looks like a repeat from a
-previous review of the same code, skip it — it was already addressed.
+## Development workflow
+For behavior changes, new API usage, or lifecycle changes: run codereviewer
+(agent `coder`) + tester (agent `general`) on model `opencode-go/mimo-v2.6-flash`
+with a focused brief (≤ 3 bullets from the diff). Trivial changes (typos,
+comments, version bumps): syntax check only. Refactors: tester only.
+Subagents are read-only — they must not edit files. Fix their findings before
+committing.
 
 ## Versioning & commits
 - Conventional Commits: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`.
-- Bump `extension/metadata.json` `version` (int) and `version-name` (SemVer) on
-  each user-visible change; tag releases as `v<version-name>`.
+- Bump `extension/metadata.json` `version` (int) and `version-name` (SemVer)
+  on each user-visible change; tag releases as `v<version-name>`.
 - Push to `main` after committing (`git push`).
 
 ## Project tracking
-Sprint plan and task board live in **YouGile** (project `LangIndicator`, prefix
-`LAN`), not in this repo. `readme.md` phases map to sprints 0–3.
+Task board: **YouGile** (project `LangIndicator`, prefix `LAN`), not in this repo.
