@@ -52,17 +52,46 @@ cp extension/extension.js /tmp/extension.mjs && node --check /tmp/extension.mjs
 ```
 
 ## Development workflow (mandatory)
-Before delivering any code change, run two subagents on model
-`opencode-go/mimo-v2.6-flash` and fix their findings before finishing:
-- **codereviewer** — agent `coder`: correctness, GNOME Shell API usage, crash risk.
+Before delivering any code change, decide whether subagents are needed and
+what to focus on. **Do not run a blanket review every time.**
+
+### Step 1 — Classify the change
+Look at `git diff` (or the edits just made) and categorise:
+
+| Change type | Subagents to run |
+|---|---|
+| Trivial (typos, comments, `metadata.json` version bump, readme rewording) | **None.** Run only the `node --check` syntax check if a `.js` file changed. |
+| Refactor / rename / move code (no behaviour change) | **Tester only** — verify nothing broke. Skip codereviewer. |
+| Behaviour change, new API usage, new signal handler, lifecycle change | **Both** — codereviewer + tester. |
+
+### Step 2 — Write a focused brief (≤ 3 bullets)
+Before spawning codereviewer, write a short brief derived from the diff.
+The brief tells the reviewer **what to look at this time only.** Examples:
+
+- "New `set-cursor-location-relative` handler — check coordinate conversion and null-guard on missing `rect`."
+- "Moved popup creation out of `_onCursorMoved` — check no duplicate St.Widget leaks."
+- "Changed signal disconnect in `disable()` — check no dangling listeners."
+
+Do **not** say "review for correctness, API usage, crash risk" — that is the
+standing rule and causes repetitive findings.
+
+### Step 3 — Run subagents on model `opencode-go/mimo-v2.6-flash`
+Pass the brief as part of the prompt. Each subagent must stay within its
+scope and not re-check areas unchanged since the last review.
+
+- **codereviewer** — agent `coder`: check ONLY the areas listed in the brief.
+  If the brief is empty or trivial, skip this subagent entirely.
 - **tester** — agent `general`: verification ONLY (not code review).
-  The tester must:
-  1. **First write a short test plan** (3–5 bullet hypotheses) and follow it.
+  1. **First write a short test plan** (3–5 bullet hypotheses) targeting the
+     changed behaviour.
   2. Keep the hypothesis count small and stop once the plan is covered.
-  3. Run the ESM `node --check` syntax check above and verify `metadata.json`
+  3. Run the ESM `node --check` syntax check and verify `metadata.json`
      `uuid` / `shell-version` against `scripts/install.sh`.
   4. Report pass/fail per hypothesis. Do **not** re-review code or list
      style/code-quality issues — that is the codereviewer's job.
+
+Fix findings before finishing. If a finding looks like a repeat from a
+previous review of the same code, skip it — it was already addressed.
 
 ## Versioning & commits
 - Conventional Commits: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`.
