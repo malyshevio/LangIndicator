@@ -33,21 +33,13 @@ import {getInputSourceManager} from 'resource:///org/gnome/shell/ui/status/keybo
 
 const CARET_MOVED = 'object:text-caret-moved';
 const FOCUS_CHANGED = 'object:state-changed:focused';
-// Склейка частых событий AT-SPI/IBus в один relayout (~60 Гц).
-const UPDATE_DELAY_MS = 16;
+// Склейка частых событий AT-SPI/IBus в один relayout.
+// Минимальная задержка для снижения нагрузки, но достаточно быстрая, чтобы не отставать.
+const UPDATE_DELAY_MS = 8;
 // Допуск при проверке «каретка внутри окна фокуса»: отсекает запоздалые
 // события предыдущего окна, но не спотыкается на тени/декорациях и на
 // расхождении origin у разных приложений.
 const BOUNDS_MARGIN = 128;
-// Роли, у которых есть каретка: для них при фокусе допустимо позиционироваться
-// по extents самого виджета (если приложение не отдаёт offset каретки).
-const TEXT_ROLES = new Set([
-    Atspi.Role.TEXT,
-    Atspi.Role.ENTRY,
-    Atspi.Role.PARAGRAPH,
-    Atspi.Role.DOCUMENT_TEXT,
-    Atspi.Role.TERMINAL,
-]);
 
 const Indicator = class Indicator extends BoxPointer.BoxPointer {
     static {
@@ -55,7 +47,7 @@ const Indicator = class Indicator extends BoxPointer.BoxPointer {
     }
 
     constructor() {
-        super(St.Side.TOP);
+        super(St.Side.LEFT);
         this._isOpen = false;
         this.visible = false;
         this.add_style_class_name('lang-indicator-boxpointer');
@@ -270,16 +262,19 @@ export default class LangIndicatorExtension extends Extension {
             if (!this._isFocusWindowPid(accessible))
                 return;
 
-            const extents = this._caretExtents(accessible, event, isFocus);
+            // Для focus-changed НЕ пытаемся получить позицию каретки — ждём caret-moved.
+            // Это избежит "мигания" (индикатор наверху виджета → у каретки).
+            if (isFocus)
+                return;
+
+            const extents = this._caretExtents(accessible, event);
             if (extents) {
                 this._applyGeometry(this._atspiToStage(extents), 'atspi');
                 return;
             }
 
-            // Фокус ушёл на виджет без каретки (кнопка, картинка) — держать
-            // старую позицию в этом окне смысла нет.
-            if (isFocus)
-                this._forgetCaret();
+            // Caret-moved для виджета без каретки — забываем позицию.
+            this._forgetCaret();
         } catch (e) {
             // Отдельные события без корректных extents игнорируем.
         }
@@ -304,14 +299,11 @@ export default class LangIndicatorExtension extends Extension {
         return !(sourcePid > 0 && focusPid > 0 && sourcePid !== focusPid);
     }
 
-    _caretExtents(accessible, event, isFocus) {
+    _caretExtents(accessible, event) {
         const text = accessible.get_text_iface();
         if (text) {
-            // У caret-moved новый offset приходит в detail1; запрос
-            // get_caret_offset() может отдать устаревшее значение.
-            let offset = isFocus ? -1 : event.detail1;
-            if (!(offset >= 0))
-                offset = text.get_caret_offset();
+            // У caret-moved новый offset приходит в detail1.
+            const offset = event.detail1;
             if (offset >= 0) {
                 const extents = text.get_character_extents(
                     offset, Atspi.CoordType.WINDOW);
@@ -319,19 +311,6 @@ export default class LangIndicatorExtension extends Extension {
                     return extents;
             }
         }
-
-        // Фокус на текстовом виджете без offset каретки (например, пустое
-        // поле): позиционируемся по extents самого виджета. Для кнопок и
-        // прочих нетекстовых ролей этого не делаем — каретки там нет.
-        if (isFocus && TEXT_ROLES.has(accessible.get_role())) {
-            const component = accessible.get_component_iface();
-            if (component) {
-                const extents = component.get_extents(Atspi.CoordType.WINDOW);
-                if (extents && (extents.width > 0 || extents.height > 0))
-                    return extents;
-            }
-        }
-
         return null;
     }
 
@@ -346,9 +325,14 @@ export default class LangIndicatorExtension extends Extension {
         const scaleFactor =
             St.ThemeContext.get_for_stage(global.stage).scale_factor;
 
+        // get_character_extents возвращает позицию СИМВОЛА, а каретка находится
+        // ПОСЛЕ символа. Используем extents.x + extents.width для позиции каретки.
+        const caretX = extents.x + extents.width;
+        const caretY = extents.y;
+
         return {
-            x: Math.round(windowRect.x + (scaleFactor * extents.x)),
-            y: Math.round(windowRect.y + (scaleFactor * extents.y)),
+            x: Math.round(windowRect.x + (scaleFactor * caretX)),
+            y: Math.round(windowRect.y + (scaleFactor * caretY)),
             width: Math.round(scaleFactor * extents.width),
             height: Math.round(scaleFactor * extents.height),
         };
@@ -362,10 +346,8 @@ export default class LangIndicatorExtension extends Extension {
 
         // Отсекаем позиции вне окна фокуса (запоздалые события, чужие окна,
         // битые extents). Позиция мыши не подставляется ни при каких условиях.
-        if (!this._isInsideFocusWindow(rect)) {
-            log(`[LangIndicator] ${source}: ${rect.x},${rect.y} вне окна, skip`);
+        if (!this._isInsideFocusWindow(rect))
             return;
-        }
 
         this._geometry = rect;
         if (this._source !== source)
